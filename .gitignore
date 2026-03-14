@@ -1,0 +1,8 @@
+DALTP_dataset/
+
+venv/
+.venv/
+env/
+
+.env
+*.env
