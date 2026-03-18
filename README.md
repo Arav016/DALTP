@@ -142,39 +142,39 @@ cd DALTP
 ```
 
 # Create virtual environment
-
+```bash
 python -m venv venv && source venv/bin/activate
-
+```
 # Install dependencies
-
+```bash
 pip install -r requirements.txt
-
+```
 # Copy environment config
-
+```bash
 cp .env.example .env # Edit with your API keys and storage paths
-
+```
 # Launch supporting services (Redis, MinIO, Postgres)
-
+```bash
 docker-compose up -d
-
+```
 ## Quick Start
 
 # 1. Prepare your domain data
-
+```bash
 python scripts/ingest.py --source ./my_documents --output data/domain_v1
-
+```
 # 2. Launch a LoRA fine-tuning run
-
+```bash
 python training/trainer.py --config configs/lora_mistral7b.yaml --data data/domain_v1
-
+```
 # 3. Run automated evaluation
-
+```bash
 python evaluation/run_eval.py --checkpoint runs/mistral7b_lora_v1 --benchmark benchmarks/domain_qa
-
+```
 # 4. Start the inference API
-
+```bash
 python serving/api/main.py --adapter runs/mistral7b_lora_v1/final_adapter
-
+```
 ## 🤝 Contributing
 
 Pull requests are welcome!  

@@ -2,7 +2,12 @@ DALTP_dataset/
 
 venv/
 .venv/
-env/
 
+env/
 .env
 *.env
+
+scripts/
+.scripts/
+
+__pycache__/
