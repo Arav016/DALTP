@@ -1,20 +1,13 @@
 import argparse
 import csv
-import hashlib
-import os
-import uuid
 import fitz
 import embed_db
 import embeddings as embed
 import pandas as pd
 from pathlib import Path
-from typing import Iterable
 from docx import Document as DocxDocument
 from dotenv import load_dotenv
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from openai import AzureOpenAI, OpenAI
-from qdrant_client import QdrantClient
-from qdrant_client.http import models
 
 load_dotenv()
 

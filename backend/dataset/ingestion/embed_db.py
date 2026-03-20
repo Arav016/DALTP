@@ -1,16 +1,7 @@
-import argparse
-import csv
 import hashlib
 import os
 import uuid
-import fitz
-import pandas as pd
-from pathlib import Path
-from typing import Iterable
-from docx import Document as DocxDocument
 from dotenv import load_dotenv
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from openai import AzureOpenAI, OpenAI
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
 
@@ -20,26 +11,14 @@ qdrant_endpoint = os.getenv("Qdrant_endpoint")
 qdrant_api_key = os.getenv("Qdrant_api_key")
 client = QdrantClient(url=qdrant_endpoint, api_key=qdrant_api_key)
 
-def checking_for_collection(collection_name: str):
-    collections = client.get_collections().collections
-    existing_names = {collection.name for collection in collections}
-    if collection_name in existing_names:
-        return
-
-    client.create_collection(
-        collection_name=collection_name,
-        vectors_config=models.VectorParams(
-            size=1536,
-            distance=models.Distance.COSINE,
-        ),
-    )
-
 def check_collection(collection_name, vector_size):
         collections =client.get_collections().collections
+        existing_names = set()
         for collection in collections:
-            existing_names = {collection.name}
+            existing_names.add(collection.name)
         
         if collection_name in existing_names:
+            print(f"Collection '{collection_name}' already exists.")
             return
 
         client.create_collection(
@@ -49,6 +28,7 @@ def check_collection(collection_name, vector_size):
                 distance=models.Distance.COSINE,
             ),
         )
+        print(f"Collection '{collection_name}' created successfully.")
 
 def upsert(collection_name, chunks, embeddings):
         points = []

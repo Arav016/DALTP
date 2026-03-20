@@ -1,18 +1,6 @@
-import argparse
-import csv
-import hashlib
 import os
-import uuid
-import fitz
-import pandas as pd
 from pathlib import Path
-from typing import Iterable
-from docx import Document as DocxDocument
-from dotenv import load_dotenv
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from openai import AzureOpenAI, OpenAI
-from qdrant_client import QdrantClient
-from qdrant_client.http import models
+from openai import AzureOpenAI
 
 def generate_embeddings(text):
     model_name = os.getenv("Text_embedding_model")

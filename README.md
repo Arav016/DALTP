@@ -177,6 +177,20 @@ python serving/api/main.py --adapter runs/mistral7b_lora_v1/final_adapter
 ```
 ## 🤝 Contributing
 
+## Dataset Construction
+
+After ingestion, dataset creation should be treated as three separate outputs instead of one merged training file:
+
+- Corpus dataset: raw document text for domain adaptation or continued pretraining
+- QA dataset: grounded question-answer pairs for document-based answering
+- Instruction dataset: task-following examples for supervised fine-tuning
+
+Raw joined chunk text should not be treated as the same kind of data as QA or instruction tuning examples. Corpus text teaches domain language and terminology, while QA and instruction datasets teach explicit response behavior.
+
+Instruction data should be created from document-grounded tasks such as summarization, extraction, explanation, comparison, classification, and risk spotting. These examples should be stored in chat-style prompt/response format so they align with instruction-tuned chat models.
+
+Synthetic Data Kit can be useful for generating QA pairs and some summary-style examples, but its outputs should still be curated and reviewed before training.
+
 Pull requests are welcome!  
 To contribute:
 
