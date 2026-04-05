@@ -11,3 +11,6 @@ scripts/
 .scripts/
 
 __pycache__/
+
+backend/dataset/dataset_construction/generated_datasets/
+

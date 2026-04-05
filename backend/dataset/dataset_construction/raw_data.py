@@ -1,16 +1,7 @@
 import argparse
 import json
-import sys
 from pathlib import Path
-
-
-CURRENT_DIR = Path(__file__).resolve().parent
-INGESTION_DIR = CURRENT_DIR.parent / "ingestion"
-if str(INGESTION_DIR) not in sys.path:
-    sys.path.insert(0, str(INGESTION_DIR))
-
-import ingestion.data_ingestion as ingestion
-
+from backend.dataset.ingestion import data_ingestion as ingestion
 
 def collect_documents(input_path):
     path = Path(input_path)

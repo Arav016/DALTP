@@ -1,8 +1,8 @@
 import argparse
 import csv
 import fitz
-import embed_db
-import embeddings as embed
+from backend.dataset.ingestion import embed_db
+from backend.dataset.ingestion import embeddings as embed
 import pandas as pd
 from pathlib import Path
 from docx import Document as DocxDocument

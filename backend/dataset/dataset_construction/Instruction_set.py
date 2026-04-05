@@ -1,17 +1,8 @@
 import argparse
 import json
 import os
-import sys
 from pathlib import Path
-
 from openai import OpenAI
-
-
-CURRENT_DIR = Path(__file__).resolve().parent
-REPO_ROOT = CURRENT_DIR.parents[2]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-
 from backend.dataset.dataset_construction import QApair as qa_builder
 from backend.dataset.ingestion import data_ingestion as ingestion
 
@@ -54,11 +45,11 @@ def build_instruction_dataset(
     max_contexts_per_document=3,
     task_types=None,
 ):
-    documents = qa_builder.collect_documents(input_path)
+    documents = qa_builder.collect_documents(input_path) #collects chunks of data
     if not documents:
         raise ValueError(f"No supported files found under '{input_path}'.")
 
-    grouped_documents = qa_builder.group_documents_by_source(documents)
+    grouped_documents = qa_builder.group_documents_by_source(documents) #groups documents by their source
     if not grouped_documents:
         raise ValueError("No normalized document text was created for instruction generation.")
 

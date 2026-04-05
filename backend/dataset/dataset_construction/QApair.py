@@ -1,20 +1,12 @@
 import argparse
-import hashlib
 import json
-import subprocess
-import sys
+import os
+import re
 from pathlib import Path
 
-
-CURRENT_DIR = Path(__file__).resolve().parent
-REPO_ROOT = CURRENT_DIR.parents[2]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+from openai import OpenAI
 
 from backend.dataset.ingestion import data_ingestion as ingestion
-
-
-SDK_SUFFIXES = ("_qa_pairs", "_cleaned", "_curated")
 
 
 def collect_documents(input_path):
@@ -24,44 +16,14 @@ def collect_documents(input_path):
 
     documents = []
     if path.is_file():
-        documents.extend(load_supported_file(path))
+        documents.extend(ingestion.load_file(path))
         return documents
 
     for file_path in sorted(path.rglob("*")):
-        if file_path.is_file() and is_supported(file_path):
-            documents.extend(load_supported_file(file_path))
+        if file_path.is_file() and file_path.suffix.lower() in ingestion.SUPPORTED_EXTENSIONS:
+            documents.extend(ingestion.load_file(file_path))
 
     return documents
-
-
-def is_supported(file_path):
-    return file_path.suffix.lower() in ingestion.SUPPORTED_EXTENSIONS or file_path.suffix.lower() == ".doc"
-
-
-def load_supported_file(file_path):
-    if file_path.suffix.lower() == ".doc":
-        return [load_doc(file_path)]
-    return ingestion.load_file(file_path)
-
-
-def load_doc(file_path):
-    try:
-        import textract  # type: ignore
-    except ImportError as exc:
-        raise ImportError(
-            "Legacy .doc support requires the optional 'textract' package."
-        ) from exc
-
-    text = textract.process(str(file_path)).decode("utf-8", errors="ignore").strip()
-    if not text:
-        raise ValueError(f"No readable text found in DOC file: {file_path}")
-
-    return {
-        "text": text,
-        "source": str(file_path),
-        "file_name": file_path.name,
-        "page": 1,
-    }
 
 
 def group_documents_by_source(documents):
@@ -106,65 +68,173 @@ def page_sort_key(page):
     return (1, str(page))
 
 
-def prepare_sdk_inputs(documents, parsed_dir):
-    parsed_dir.mkdir(parents=True, exist_ok=True)
-    manifest = {}
+def build_file_stem(file_name, existing_files):
+    base_name = Path(file_name).stem
+    safe_name = "".join(char if char.isalnum() or char in ("-", "_") else "_" for char in base_name).strip("_")
+    if not safe_name:
+        safe_name = "document"
 
-    for document in documents:
-        doc_id = build_doc_id(document["source"])
-        txt_path = parsed_dir / f"{doc_id}.txt"
-        txt_path.write_text(document["text"], encoding="utf-8")
-        manifest[doc_id] = {
-            "source": document["source"],
-            "file_name": document["file_name"],
-            "parsed_text_path": str(txt_path),
-        }
-
-    manifest_path = parsed_dir / "manifest.json"
-    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    return manifest_path
+    candidate = safe_name
+    counter = 1
+    while candidate in existing_files:
+        counter += 1
+        candidate = f"{safe_name}_{counter}"
+    return candidate
 
 
-def build_doc_id(source):
-    source_path = Path(source)
-    digest = hashlib.md5(source.encode("utf-8")).hexdigest()[:10]
-    safe_stem = "".join(char if char.isalnum() or char in ("-", "_") else "_" for char in source_path.stem)
-    return f"{safe_stem}_{digest}"
+def build_qa_record(metadata, question, answer):
+    return {
+        "dataset_type": "qa",
+        "source": metadata["source"],
+        "file_name": metadata["file_name"],
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are a domain assistant. Answer using only the provided source document context.",
+            },
+            {
+                "role": "user",
+                "content": question,
+            },
+            {
+                "role": "assistant",
+                "content": answer,
+            },
+        ],
+    }
 
 
-def write_sdk_config(config_path, model_name, api_base, num_pairs, chunk_size, chunk_overlap, threshold):
-    config_text = f"""llm:
-  provider: "vllm"
+def extract_json_array(content):
+    text = (content or "").strip()
+    if not text:
+        return []
 
-vllm:
-  api_base: "{api_base}"
-  model: "{model_name}"
-  sleep_time: 0.2
+    try:
+        payload = json.loads(text)
+        return payload if isinstance(payload, list) else []
+    except json.JSONDecodeError:
+        pass
 
-generation:
-  temperature: 0.7
-  chunk_size: {chunk_size}
-  chunk_overlap: {chunk_overlap}
-  num_pairs: {num_pairs}
-  max_context_length: 8000
+    fence_match = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL)
+    if fence_match:
+        fenced = fence_match.group(1).strip()
+        try:
+            payload = json.loads(fenced)
+            return payload if isinstance(payload, list) else []
+        except json.JSONDecodeError:
+            text = fenced
 
-curate:
-  threshold: {threshold}
-  batch_size: 8
-"""
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-    config_path.write_text(config_text, encoding="utf-8")
+    array_match = re.search(r"\[\s*\{.*\}\s*\]", text, re.DOTALL)
+    if not array_match:
+        return []
+
+    candidate = array_match.group(0)
+    repaired = re.sub(r"(\}\s*)(\{)", r"\1,\2", candidate)
+    repaired = re.sub(r",\s*]", "]", repaired)
+    try:
+        payload = json.loads(repaired)
+    except json.JSONDecodeError:
+        return []
+    return payload if isinstance(payload, list) else []
 
 
-def run_sdk_command(command, workdir):
-    completed = subprocess.run(
-        command,
-        check=True,
-        capture_output=True,
-        text=True,
-        cwd=workdir,
+def normalize_entries(entries):
+    normalized = []
+    seen_questions = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        question = str(entry.get("question", "")).strip()
+        answer = str(entry.get("answer", "")).strip()
+        if not question or not answer:
+            continue
+
+        question_key = " ".join(question.lower().split())
+        if question_key in seen_questions:
+            continue
+        seen_questions.add(question_key)
+        normalized.append({"question": question, "answer": answer})
+    return normalized
+
+
+def write_debug_artifacts(workspace_dir, file_stem, prompt, response_text, entries):
+    if not workspace_dir:
+        return
+
+    debug_dir = Path(workspace_dir) / "debug"
+    debug_dir.mkdir(parents=True, exist_ok=True)
+
+    (debug_dir / f"{file_stem}_prompt.txt").write_text(prompt, encoding="utf-8")
+    (debug_dir / f"{file_stem}_response.txt").write_text(response_text, encoding="utf-8")
+    (debug_dir / f"{file_stem}_parsed.json").write_text(
+        json.dumps(entries, ensure_ascii=False, indent=2),
+        encoding="utf-8",
     )
-    return completed.stdout
+
+
+def generate_qa_entries(client, model_name, document_text, num_pairs, max_retries):
+    prompt = f"""Generate {num_pairs} grounded question-answer pairs based only on the document text.
+Return ONLY valid JSON in this exact format:
+[
+  {{
+    "question": "Question text",
+    "answer": "Answer text"
+  }}
+]
+Rules:
+- Use only information supported by the document text.
+- Do not include markdown fences.
+- Do not include commentary or explanation.
+- Do not include text before or after the JSON.
+- Separate every object in the array with a comma.
+- Write specific, useful questions. Avoid duplicates.
+- Write concise, evidence-grounded answers.
+
+Document text:
+---
+{document_text}
+---
+"""
+
+    last_response_text = ""
+    for attempt in range(max_retries):
+        response = client.chat.completions.create(
+            model=model_name,
+            temperature=0.2,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You create grounded QA pairs for legal and business documents and must return valid JSON only.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+        )
+        last_response_text = response.choices[0].message.content or ""
+        entries = normalize_entries(extract_json_array(last_response_text))
+        if entries:
+            return prompt, last_response_text, entries
+
+        prompt = f"""Your previous response was not valid JSON or did not contain usable question-answer pairs.
+Fix the response and return ONLY valid JSON in this exact format:
+[
+  {{
+    "question": "Question text",
+    "answer": "Answer text"
+  }}
+]
+Remember:
+- no markdown fences
+- no commentary
+- no extra text
+- commas between objects
+
+Document text:
+---
+{document_text}
+---
+"""
+
+    return prompt, last_response_text, []
 
 
 def build_qa_dataset(
@@ -173,11 +243,11 @@ def build_qa_dataset(
     output_path,
     model_name="meta-llama/Llama-3.1-8B-Instruct",
     api_base="http://localhost:8000/v1",
-    num_pairs=20,
-    chunk_size=4000,
-    chunk_overlap=100,
-    curate_threshold=7.5,
-    skip_curate=False,
+    num_pairs=10,
+    chunk_size=5000,
+    chunk_overlap=200,
+    max_contexts_per_document=3,
+    max_retries=2,
 ):
     documents = collect_documents(input_path)
     if not documents:
@@ -187,159 +257,80 @@ def build_qa_dataset(
     if not grouped_documents:
         raise ValueError("No normalized document text was created for QA generation.")
 
-    workspace = Path(workspace_dir)
-    data_dir = workspace / "data"
-    parsed_dir = data_dir / "parsed"
-    generated_dir = data_dir / "generated"
-    curated_dir = data_dir / "curated"
-    output_file = Path(output_path)
-
-    generated_dir.mkdir(parents=True, exist_ok=True)
-    curated_dir.mkdir(parents=True, exist_ok=True)
-
-    manifest_path = prepare_sdk_inputs(grouped_documents, parsed_dir)
-    config_path = workspace / "synthetic_data_kit_config.yaml"
-    write_sdk_config(
-        config_path=config_path,
-        model_name=model_name,
-        api_base=api_base,
-        num_pairs=num_pairs,
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
-        threshold=curate_threshold,
-    )
-
-    run_sdk_command(
-        [
-            "synthetic-data-kit",
-            "-c",
-            str(config_path),
-            "create",
-            str(parsed_dir),
-            "--type",
-            "qa",
-        ],
-        workspace,
-    )
-
-    qa_source_dir = generated_dir
-    if not skip_curate:
-        run_sdk_command(
-            [
-                "synthetic-data-kit",
-                "-c",
-                str(config_path),
-                "curate",
-                str(generated_dir),
-                "--threshold",
-                str(curate_threshold),
-            ],
-            workspace,
-        )
-        qa_source_dir = curated_dir
-
+    workspace = Path(workspace_dir).resolve() if workspace_dir else None
+    output_file = Path(output_path).resolve()
     output_file.parent.mkdir(parents=True, exist_ok=True)
-    records_written = merge_qa_outputs(qa_source_dir, manifest_path, output_file)
+
+    client = OpenAI(
+        base_url=api_base,
+        api_key=os.getenv("OPENAI_API_KEY", "EMPTY"),
+    )
+
+    records_written = 0
+    file_map = {}
+    with output_file.open("w", encoding="utf-8") as file_handle:
+        for document in grouped_documents:
+            file_stem = build_file_stem(document["file_name"], file_map)
+            file_map[file_stem] = True
+
+            contexts = ingestion.split_text(document["text"], chunk_size, chunk_overlap)
+            if not contexts:
+                continue
+
+            for context in contexts[:max_contexts_per_document]:
+                prompt, response_text, entries = generate_qa_entries(
+                    client=client,
+                    model_name=model_name,
+                    document_text=context,
+                    num_pairs=num_pairs,
+                    max_retries=max_retries,
+                )
+                write_debug_artifacts(workspace, file_stem, prompt, response_text, entries)
+
+                for entry in entries:
+                    record = build_qa_record(document, entry["question"], entry["answer"])
+                    file_handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    records_written += 1
 
     return {
         "documents_processed": len(grouped_documents),
         "records_written": records_written,
-        "workspace_dir": str(workspace),
+        "workspace_dir": str(workspace) if workspace else None,
         "output_path": str(output_file),
     }
 
 
-def merge_qa_outputs(qa_source_dir, manifest_path, output_path):
-    manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
-    qa_dir = Path(qa_source_dir)
-    if not qa_dir.exists():
-        raise FileNotFoundError(f"Synthetic Data Kit output directory not found: {qa_dir}")
-
-    records_written = 0
-    with Path(output_path).open("w", encoding="utf-8") as file_handle:
-        for qa_file in sorted(qa_dir.glob("*.json")):
-            doc_id = recover_doc_id(qa_file.stem)
-            metadata = manifest.get(doc_id)
-            if not metadata:
-                continue
-
-            entries = load_qa_entries(qa_file)
-            for entry in entries:
-                question = entry.get("question", "").strip()
-                answer = entry.get("answer", "").strip()
-                if not question or not answer:
-                    continue
-
-                record = {
-                    "dataset_type": "qa",
-                    "source": metadata["source"],
-                    "file_name": metadata["file_name"],
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": "You are a domain assistant. Answer using only the provided source document context.",
-                        },
-                        {
-                            "role": "user",
-                            "content": question,
-                        },
-                        {
-                            "role": "assistant",
-                            "content": answer,
-                        },
-                    ],
-                }
-                file_handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-                records_written += 1
-
-    return records_written
-
-
-def recover_doc_id(file_stem):
-    for suffix in SDK_SUFFIXES:
-        if file_stem.endswith(suffix):
-            return file_stem[: -len(suffix)]
-    return file_stem
-
-
-def load_qa_entries(qa_file):
-    payload = json.loads(qa_file.read_text(encoding="utf-8"))
-    if isinstance(payload, list):
-        return payload
-    if isinstance(payload, dict):
-        for key in ("data", "items", "examples", "results"):
-            value = payload.get(key)
-            if isinstance(value, list):
-                return value
-    return []
-
-
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Generate a QA dataset from source documents using Synthetic Data Kit."
+        description="Generate a QA dataset from source documents using an OpenAI-compatible LLM endpoint."
     )
     parser.add_argument("--input", required=True, help="Path to a file or directory of source documents.")
-    parser.add_argument("--workspace", required=True, help="Workspace directory for parsed/generated SDK files.")
+    parser.add_argument(
+        "--workspace",
+        default="",
+        help="Optional workspace directory for debug artifacts such as prompts and raw model responses.",
+    )
     parser.add_argument("--output", required=True, help="Path to the merged QA JSONL output.")
     parser.add_argument(
         "--model",
         default="meta-llama/Llama-3.1-8B-Instruct",
-        help="Model served by your vLLM endpoint for Synthetic Data Kit generation.",
+        help="Model served by your OpenAI-compatible endpoint.",
     )
     parser.add_argument(
         "--api-base",
         default="http://localhost:8000/v1",
-        help="Base URL for the vLLM OpenAI-compatible endpoint.",
+        help="Base URL for the OpenAI-compatible endpoint.",
     )
-    parser.add_argument("--num-pairs", type=int, default=20, help="Target QA pairs per document.")
-    parser.add_argument("--chunk-size", type=int, default=4000, help="Chunk size passed to Synthetic Data Kit.")
-    parser.add_argument("--chunk-overlap", type=int, default=100, help="Chunk overlap passed to Synthetic Data Kit.")
-    parser.add_argument("--curate-threshold", type=float, default=7.5, help="Quality threshold for curation.")
+    parser.add_argument("--num-pairs", type=int, default=10, help="Target QA pairs to request per context window.")
+    parser.add_argument("--chunk-size", type=int, default=5000, help="Context window size for each generation call.")
+    parser.add_argument("--chunk-overlap", type=int, default=200, help="Overlap between context windows.")
     parser.add_argument(
-        "--skip-curate",
-        action="store_true",
-        help="Skip Synthetic Data Kit curation and merge raw generated QA pairs directly.",
+        "--max-contexts-per-document",
+        type=int,
+        default=3,
+        help="Maximum context windows to use from each normalized document.",
     )
+    parser.add_argument("--max-retries", type=int, default=2, help="Retries for malformed model output.")
     return parser.parse_args()
 
 
@@ -354,8 +345,8 @@ def main():
         num_pairs=args.num_pairs,
         chunk_size=args.chunk_size,
         chunk_overlap=args.chunk_overlap,
-        curate_threshold=args.curate_threshold,
-        skip_curate=args.skip_curate,
+        max_contexts_per_document=args.max_contexts_per_document,
+        max_retries=args.max_retries,
     )
     print(
         f"Wrote {result['records_written']} QA records from "
