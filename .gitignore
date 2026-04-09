@@ -10,7 +10,10 @@ env/
 scripts/
 .scripts/
 
+/notes.txt
+
 __pycache__/
 
 backend/dataset/dataset_construction/generated_datasets/
+backend/training/outputs/
 

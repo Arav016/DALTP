@@ -1,0 +1,56 @@
+{
+  "model": {
+    "name": "meta-llama/Meta-Llama-3.1-8B-Instruct",
+    "trust_remote_code": false
+  },
+  "datasets": {
+    "qa": "backend/dataset/dataset_construction/generated_datasets/qa_pair_dataset/dataset/qa_dataset.jsonl",
+    "instruction": "backend/dataset/dataset_construction/generated_datasets/instruction_pair_dataset/instruction_dataset.jsonl"
+  },
+  "quantization": {
+    "load_in_4bit": true,
+    "bnb_4bit_quant_type": "nf4",
+    "bnb_4bit_compute_dtype": "float16",
+    "bnb_4bit_use_double_quant": true
+  },
+  "lora": {
+    "r": 16,
+    "lora_alpha": 32,
+    "lora_dropout": 0.05,
+    "target_modules": [
+      "q_proj",
+      "k_proj",
+      "v_proj",
+      "o_proj",
+      "gate_proj",
+      "up_proj",
+      "down_proj"
+    ]
+  },
+  "training": {
+    "output_dir": "backend/training/outputs/llama3_8b_sft",
+    "num_train_epochs": 3,
+    "per_device_train_batch_size": 1,
+    "per_device_eval_batch_size": 1,
+    "gradient_accumulation_steps": 8,
+    "learning_rate": 0.0001,
+    "lr_scheduler_type": "cosine",
+    "warmup_ratio": 0.03,
+    "logging_steps": 10,
+    "save_steps": 50,
+    "eval_steps": 50,
+    "save_strategy": "steps",
+    "eval_strategy": "steps",
+    "save_total_limit": 2,
+    "max_seq_length": 2048,
+    "gradient_checkpointing": true,
+    "torch_dtype": "float16",
+    "bf16": false,
+    "fp16": true,
+    "assistant_only_loss": false,
+    "packing": false,
+    "eval_ratio": 0.1,
+    "seed": 42,
+    "report_to": []
+  }
+}
