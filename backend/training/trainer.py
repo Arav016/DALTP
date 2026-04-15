@@ -1,7 +1,6 @@
 import argparse
 import json
 from pathlib import Path
-
 import torch
 from datasets import Dataset
 from peft import LoraConfig
@@ -88,11 +87,14 @@ def build_model(config):
         "trust_remote_code": config["model"].get("trust_remote_code", False),
     }
 
-    torch_dtype = training_config.get("torch_dtype", "bfloat16")
-    if torch_dtype == "bfloat16":
-        model_kwargs["torch_dtype"] = torch.bfloat16
-    elif torch_dtype == "float16":
-        model_kwargs["torch_dtype"] = torch.float16
+    dtype_name = training_config["dtype"]
+    if dtype_name == "bfloat16":
+        model_kwargs["dtype"] = torch.bfloat16
+    elif dtype_name == "float16":
+        model_kwargs["dtype"] = torch.float16
+    else:
+        raise ValueError(f"Unsupported training.dtype: {dtype_name}")
+
 
     if quantization.get("load_in_4bit"):
         model_kwargs["quantization_config"] = BitsAndBytesConfig(
@@ -102,6 +104,24 @@ def build_model(config):
             bnb_4bit_use_double_quant=quantization.get("bnb_4bit_use_double_quant", True),
         )
         model_kwargs["device_map"] = "auto"
+
+    if quantization.get("load_in_4bit"):
+        quant_dtype_name = quantization["bnb_4bit_compute_dtype"]
+        if quant_dtype_name == "bfloat16":
+            quant_dtype = torch.bfloat16
+        elif quant_dtype_name == "float16":
+            quant_dtype = torch.float16
+        else:
+            raise ValueError(f"Unsupported quantization.bnb_4bit_compute_dtype: {quant_dtype_name}")
+
+        model_kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type=quantization.get("bnb_4bit_quant_type", "nf4"),
+            bnb_4bit_compute_dtype=quant_dtype,
+            bnb_4bit_use_double_quant=quantization.get("bnb_4bit_use_double_quant", True),
+        )
+        model_kwargs["device_map"] = "auto"
+
 
     model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
     model.config.use_cache = False
@@ -151,7 +171,7 @@ def train_model(config):
         bf16=config["training"].get("bf16", True),
         fp16=config["training"].get("fp16", False),
         gradient_checkpointing=config["training"].get("gradient_checkpointing", True),
-        max_seq_length=config["training"].get("max_seq_length", 2048),
+        max_length=config["training"].get("max_length", 2048),
         assistant_only_loss=config["training"].get("assistant_only_loss", True),
         packing=config["training"].get("packing", False),
         dataset_text_field=None,

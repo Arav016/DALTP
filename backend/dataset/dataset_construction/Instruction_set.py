@@ -4,7 +4,6 @@ import os
 from pathlib import Path
 from openai import OpenAI
 from backend.dataset.dataset_construction import QApair as qa_builder
-from backend.dataset.ingestion import data_ingestion as ingestion
 
 
 TASK_TEMPLATES = {
@@ -42,7 +41,7 @@ def build_instruction_dataset(
     api_base="http://localhost:8000/v1",
     context_size=5000,
     context_overlap=200,
-    max_contexts_per_document=3,
+    max_contexts_per_document=None,
     task_types=None,
 ):
     documents = qa_builder.collect_documents(input_path) #collects chunks of data
@@ -65,11 +64,21 @@ def build_instruction_dataset(
     records_written = 0
     with output_file.open("w", encoding="utf-8") as file_handle:
         for document in grouped_documents:
-            contexts = ingestion.split_text(document["text"], context_size, context_overlap)
+            text = document["text"].strip()
+            if not text:
+                continue
+
+            if len(text) <= context_size:
+                contexts = [text]
+            else:
+                contexts = qa_builder.ingestion.split_text(text, context_size, context_overlap)
+                if max_contexts_per_document is not None and max_contexts_per_document > 0:
+                    contexts = contexts[:max_contexts_per_document]
+
             if not contexts:
                 continue
 
-            for context_index, context in enumerate(contexts[:max_contexts_per_document]):
+            for context_index, context in enumerate(contexts):
                 for task_type in selected_tasks:
                     template = TASK_TEMPLATES[task_type]
                     messages = [
@@ -145,8 +154,8 @@ def parse_args():
     parser.add_argument(
         "--max-contexts-per-document",
         type=int,
-        default=3,
-        help="Maximum context windows to use from each document.",
+        default=None,
+        help="Maximum context windows to use from each document. Default uses the full file.",
     )
     parser.add_argument(
         "--task-types",

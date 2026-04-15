@@ -26,7 +26,7 @@ def collect_documents(input_path):
     return documents
 
 
-def group_documents_by_source(documents):
+def group_documents_by_source(documents): #groups pages together of a document
     grouped = {}
     for document in documents:
         source = document["source"]
@@ -68,20 +68,6 @@ def page_sort_key(page):
     return (1, str(page))
 
 
-def build_file_stem(file_name, existing_files):
-    base_name = Path(file_name).stem
-    safe_name = "".join(char if char.isalnum() or char in ("-", "_") else "_" for char in base_name).strip("_")
-    if not safe_name:
-        safe_name = "document"
-
-    candidate = safe_name
-    counter = 1
-    while candidate in existing_files:
-        counter += 1
-        candidate = f"{safe_name}_{counter}"
-    return candidate
-
-
 def build_qa_record(metadata, question, answer):
     return {
         "dataset_type": "qa",
@@ -105,12 +91,12 @@ def build_qa_record(metadata, question, answer):
 
 
 def extract_json_array(content):
-    text = (content or "").strip()
+    text = (content or "").strip()  #remove whitespace from the start and end of the string
     if not text:
         return []
 
-    try:
-        payload = json.loads(text)
+    try: #checks for valid JSON
+        payload = json.loads(text) #parses
         return payload if isinstance(payload, list) else []
     except json.JSONDecodeError:
         pass
@@ -155,21 +141,6 @@ def normalize_entries(entries):
         seen_questions.add(question_key)
         normalized.append({"question": question, "answer": answer})
     return normalized
-
-
-def write_debug_artifacts(workspace_dir, file_stem, prompt, response_text, entries):
-    if not workspace_dir:
-        return
-
-    debug_dir = Path(workspace_dir) / "debug"
-    debug_dir.mkdir(parents=True, exist_ok=True)
-
-    (debug_dir / f"{file_stem}_prompt.txt").write_text(prompt, encoding="utf-8")
-    (debug_dir / f"{file_stem}_response.txt").write_text(response_text, encoding="utf-8")
-    (debug_dir / f"{file_stem}_parsed.json").write_text(
-        json.dumps(entries, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
 
 
 def generate_qa_entries(client, model_name, document_text, num_pairs, max_retries):
@@ -239,14 +210,13 @@ Document text:
 
 def build_qa_dataset(
     input_path,
-    workspace_dir,
     output_path,
     model_name="meta-llama/Llama-3.1-8B-Instruct",
     api_base="http://localhost:8000/v1",
     num_pairs=10,
     chunk_size=5000,
     chunk_overlap=200,
-    max_contexts_per_document=3,
+    max_contexts_per_document=None,
     max_retries=2,
 ):
     documents = collect_documents(input_path)
@@ -257,7 +227,6 @@ def build_qa_dataset(
     if not grouped_documents:
         raise ValueError("No normalized document text was created for QA generation.")
 
-    workspace = Path(workspace_dir).resolve() if workspace_dir else None
     output_file = Path(output_path).resolve()
     output_file.parent.mkdir(parents=True, exist_ok=True)
 
@@ -267,35 +236,39 @@ def build_qa_dataset(
     )
 
     records_written = 0
-    file_map = {}
     with output_file.open("w", encoding="utf-8") as file_handle:
         for document in grouped_documents:
-            file_stem = build_file_stem(document["file_name"], file_map)
-            file_map[file_stem] = True
+            text = document["text"].strip()
+            if not text:
+                continue
 
-            contexts = ingestion.split_text(document["text"], chunk_size, chunk_overlap)
+            if len(text) <= chunk_size:
+                contexts = [text]
+            else:
+                contexts = ingestion.split_text(text, chunk_size, chunk_overlap)
+                if max_contexts_per_document is not None and max_contexts_per_document > 0:
+                    contexts = contexts[:max_contexts_per_document]
+
             if not contexts:
                 continue
 
-            for context in contexts[:max_contexts_per_document]:
-                prompt, response_text, entries = generate_qa_entries(
+            for context in contexts:
+                _, _, entries = generate_qa_entries(
                     client=client,
                     model_name=model_name,
                     document_text=context,
                     num_pairs=num_pairs,
                     max_retries=max_retries,
                 )
-                write_debug_artifacts(workspace, file_stem, prompt, response_text, entries)
 
                 for entry in entries:
                     record = build_qa_record(document, entry["question"], entry["answer"])
-                    file_handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    file_handle.write(json.dumps(record, ensure_ascii=False) + "\n") #converts python object to JSON string and writes to file
                     records_written += 1
 
     return {
         "documents_processed": len(grouped_documents),
         "records_written": records_written,
-        "workspace_dir": str(workspace) if workspace else None,
         "output_path": str(output_file),
     }
 
@@ -305,11 +278,6 @@ def parse_args():
         description="Generate a QA dataset from source documents using an OpenAI-compatible LLM endpoint."
     )
     parser.add_argument("--input", required=True, help="Path to a file or directory of source documents.")
-    parser.add_argument(
-        "--workspace",
-        default="",
-        help="Optional workspace directory for debug artifacts such as prompts and raw model responses.",
-    )
     parser.add_argument("--output", required=True, help="Path to the merged QA JSONL output.")
     parser.add_argument(
         "--model",
@@ -327,8 +295,8 @@ def parse_args():
     parser.add_argument(
         "--max-contexts-per-document",
         type=int,
-        default=3,
-        help="Maximum context windows to use from each normalized document.",
+        default=None,
+        help="Maximum context windows to use from each normalized document. Default uses the full file.",
     )
     parser.add_argument("--max-retries", type=int, default=2, help="Retries for malformed model output.")
     return parser.parse_args()
@@ -338,7 +306,6 @@ def main():
     args = parse_args()
     result = build_qa_dataset(
         input_path=args.input,
-        workspace_dir=args.workspace,
         output_path=args.output,
         model_name=args.model,
         api_base=args.api_base,

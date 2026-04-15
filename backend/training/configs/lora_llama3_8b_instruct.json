@@ -10,7 +10,7 @@
   "quantization": {
     "load_in_4bit": true,
     "bnb_4bit_quant_type": "nf4",
-    "bnb_4bit_compute_dtype": "float16",
+    "bnb_4bit_compute_dtype": "bfloat16",
     "bnb_4bit_use_double_quant": true
   },
   "lora": {
@@ -42,11 +42,11 @@
     "save_strategy": "steps",
     "eval_strategy": "steps",
     "save_total_limit": 2,
-    "max_seq_length": 2048,
+    "max_length": 2048,
     "gradient_checkpointing": true,
-    "torch_dtype": "float16",
-    "bf16": false,
-    "fp16": true,
+    "dtype": "bfloat16",
+    "bf16": true,
+    "fp16": false,
     "assistant_only_loss": false,
     "packing": false,
     "eval_ratio": 0.1,
