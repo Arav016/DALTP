@@ -16,5 +16,6 @@ __pycache__/
 
 backend/dataset/dataset_construction/generated_datasets/
 backend/training/outputs/
+backend/evaluation/outputs/
 local_run_commands.md
 
