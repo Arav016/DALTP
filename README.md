@@ -18,7 +18,7 @@ DALTP, the **Domain Adaptive LLM Training Platform**, is a practical end-to-end 
   - QLoRA-style fine-tuning of `Llama 3.1 8B`
   - JSON-based trainer configuration
 - **RAG support**
-  - Qdrant-backed retrieval in evaluation and prediction generation
+  - pgvector-backed retrieval in evaluation and prediction generation
   - Embedding generation through the ingestion layer
 - **Evaluation**
   - Held-out benchmark generation from unseen documents
@@ -34,6 +34,13 @@ DALTP, the **Domain Adaptive LLM Training Platform**, is a practical end-to-end 
 - **Frontend + API**
   - React frontend for overview, dataset upload, run building, bundle download, and evaluation review
   - FastAPI backend for serving run summaries, examples, datasets, and generated run bundles
+- **Persistent metadata**
+  - PostgreSQL-backed users, sessions, datasets, jobs, bundles, and model registry metadata
+  - Filesystem storage retained for larger artifacts such as uploaded source files, generated dataset files, bundle zips, and model archives
+- **Authentication**
+  - Account creation and sign-in flow for DALTP users
+  - Session restore and logout support in the frontend
+  - User-scoped uploaded datasets and prepared run bundles
 - **Execution modes**
   - Local execution when user hardware is capable enough
   - Colab-assisted workflow when local hardware is not sufficient
@@ -44,8 +51,9 @@ DALTP, the **Domain Adaptive LLM Training Platform**, is a practical end-to-end 
 - **PyTorch**
 - **Hugging Face Transformers**
 - **PEFT / bitsandbytes / TRL**
-- **Qdrant**
+- **PostgreSQL + pgvector**
 - **FastAPI**
+- **psycopg / PostgreSQL**
 - **React + Vite**
 
 ## Repo Structure
@@ -85,7 +93,6 @@ DALTP/
 |  |- package.json
 |  \- vite.config.js
 |- DALTP_dataset/               # Local document corpus used for experimentation
-|- local_run_commands.md        # Useful local CLI commands
 |- requirements.txt
 \- README.md
 ```
@@ -162,12 +169,13 @@ uvicorn backend.api.app:app --reload
 
 Main API responsibilities:
 
+- user authentication and session validation
 - dashboard metrics from scored outputs
 - run summaries and example outputs
 - dataset registry
-- uploaded dataset storage
+- uploaded dataset storage scoped to the signed-in user
 - run bundle generation
-- bundle download and launch commands
+- bundle download and launch commands scoped to the signed-in user
 
 ## Frontend
 
@@ -179,43 +187,9 @@ npm install
 npm run dev
 ```
 
-The Vite dev server proxies `/api` requests to:
-
-- `http://127.0.0.1:8000`
-
-
-That file contains the commands currently used for:
-
-- raw corpus construction
-- QA dataset construction
-- instruction dataset construction
-- training dependency installation
-- fine-tuning
-- local vLLM serving
-
 ## Colab-Assisted Execution
 
 DALTP currently supports a pragmatic hybrid workflow:
 
 - if a user's device is capable enough, use **local execution**
 - if not, use **Colab-assisted execution**
-
-The frontend/API supports this by generating run bundles that contain:
-
-- dataset artifacts
-- config JSON
-- local launch commands
-- Colab-friendly launch commands
-- bundle download archive
-
-This keeps the frontend stable while allowing heavy jobs to move to remote GPU environments when needed.
-
-## Current Evaluation Artifacts
-
-The repo currently includes a scored evaluation run under:
-
-- `backend/evaluation/outputs/test_run_01`
-
-and fine-tuned adapter outputs under:
-
-- `backend/training/outputs/llama3_8b_sft`
