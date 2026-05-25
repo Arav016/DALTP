@@ -106,7 +106,7 @@ def retrieve_context(question, collection_name, top_k):
         )
         results = getattr(response, "points", response)
     else:
-        raise AttributeError("The configured Qdrant client does not support search or query_points.")
+        raise AttributeError("The configured vector client does not support search or query_points.")
 
     retrieved_chunks = []
     for result in results:
@@ -225,7 +225,7 @@ def parse_args():
     )
     parser.add_argument("--base-model", required=True, help="Base Hugging Face model name or path.")
     parser.add_argument("--adapter-path", help="LoRA adapter path for fine-tuned modes.")
-    parser.add_argument("--collection", help="Qdrant collection name used for retrieval in RAG modes.")
+    parser.add_argument("--collection", help="pgvector namespace used for retrieval in RAG modes.")
     parser.add_argument("--top-k", type=int, default=3, help="Number of retrieved chunks to attach for RAG modes.")
     parser.add_argument("--max-new-tokens", type=int, default=256, help="Maximum generated tokens per answer.")
     parser.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature. Use 0 for greedy decoding.")

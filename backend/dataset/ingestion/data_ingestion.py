@@ -213,10 +213,10 @@ def batched(items, batch_size):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Extract documents, create chunks, embed them, and store them in Qdrant."
+        description="Extract documents, create chunks, embed them, and store them in pgvector."
     )
     parser.add_argument("--input", required=True, help="Path to a file or directory to ingest.")
-    parser.add_argument("--collection", required=True, help="Qdrant collection name.")
+    parser.add_argument("--collection", required=True, help="pgvector namespace.")
     parser.add_argument("--chunk-size", type=int, default=1000, help="Character length of each chunk.")
     parser.add_argument(
         "--chunk-overlap",

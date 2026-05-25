@@ -1,8 +1,6 @@
 import argparse
 import json
-import os
 from pathlib import Path
-from openai import OpenAI
 from backend.dataset.dataset_construction import QApair as qa_builder
 
 
@@ -37,8 +35,8 @@ TASK_TEMPLATES = {
 def build_instruction_dataset(
     input_path,
     output_path,
-    model_name="meta-llama/Llama-3.1-8B-Instruct",
-    api_base="http://localhost:8000/v1",
+    model_name=qa_builder.default_generation_model(),
+    api_base=qa_builder.default_generation_api_base(),
     context_size=5000,
     context_overlap=200,
     max_contexts_per_document=None,
@@ -52,10 +50,7 @@ def build_instruction_dataset(
     if not grouped_documents:
         raise ValueError("No normalized document text was created for instruction generation.")
 
-    client = OpenAI(
-        base_url=api_base,
-        api_key=os.getenv("OPENAI_API_KEY", "EMPTY"),
-    )
+    client = qa_builder.build_generation_client(api_base=api_base)
 
     selected_tasks = resolve_task_types(task_types)
     output_file = Path(output_path)
@@ -124,8 +119,9 @@ def resolve_task_types(task_types):
 
 
 def generate_instruction_response(client, model_name, messages):
-    response = client.chat.completions.create(
-        model=model_name,
+    response = qa_builder.create_chat_completion(
+        client=client,
+        model_name=model_name,
         messages=messages,
         temperature=0.4,
     )
@@ -141,13 +137,13 @@ def parse_args():
     parser.add_argument("--output", required=True, help="Path to the output JSONL file.")
     parser.add_argument(
         "--model",
-        default="meta-llama/Llama-3.1-8B-Instruct",
-        help="Model served by your vLLM OpenAI-compatible endpoint.",
+        default=qa_builder.default_generation_model(),
+        help="Model slug served through OpenRouter.",
     )
     parser.add_argument(
         "--api-base",
-        default="http://localhost:8000/v1",
-        help="Base URL for the vLLM OpenAI-compatible endpoint.",
+        default=qa_builder.default_generation_api_base(),
+        help="Base URL for the OpenRouter API.",
     )
     parser.add_argument("--context-size", type=int, default=5000, help="Context window size for each instruction example.")
     parser.add_argument("--context-overlap", type=int, default=200, help="Overlap between consecutive context windows.")

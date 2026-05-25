@@ -67,11 +67,11 @@ def build_benchmark_from_qa_file(qa_dataset_path, benchmark_output_path):
     return benchmark_records
 
 
-def maybe_ingest_documents(input_path, collection_name, ingest_to_qdrant):
-    if not ingest_to_qdrant:
+def maybe_ingest_documents(input_path, collection_name, ingest_to_pgvector):
+    if not ingest_to_pgvector:
         return
     if not collection_name:
-        raise ValueError("--collection is required when --ingest-to-qdrant is used.")
+        raise ValueError("--collection is required when --ingest-to-pgvector is used.")
 
     data_ingestion.ingest_documents(
         input_path=input_path,
@@ -83,20 +83,22 @@ def generate_test_benchmark(
     input_path,
     qa_dataset_path,
     benchmark_path,
-    qa_generation_model="meta-llama/Llama-3.1-8B-Instruct",
-    qa_api_base="http://localhost:8000/v1",
+    qa_generation_model=None,
+    qa_api_base=QApair.default_generation_api_base(),
     num_pairs=10,
     chunk_size=5000,
     chunk_overlap=200,
     max_contexts_per_document=None,
     max_retries=2,
     collection=None,
-    ingest_to_qdrant=False,
+    ingest_to_pgvector=False,
 ):
+    if qa_generation_model is None:
+        qa_generation_model = QApair.default_generation_model()
     maybe_ingest_documents(
         input_path=input_path,
         collection_name=collection,
-        ingest_to_qdrant=ingest_to_qdrant,
+        ingest_to_pgvector=ingest_to_pgvector,
     )
 
     QApair.build_qa_dataset(
@@ -128,12 +130,12 @@ def parse_args():
     parser.add_argument("--benchmark-output", required=True, help="Output JSONL path for the benchmark file.")
     parser.add_argument(
         "--qa-generation-model",
-        default="meta-llama/Llama-3.1-8B-Instruct",
-        help="OpenAI-compatible model name used to generate held-out QA pairs.",
+        default=QApair.default_generation_model(),
+        help="Model or deployment name used to generate held-out QA pairs.",
     )
     parser.add_argument(
         "--qa-api-base",
-        default="http://localhost:8000/v1",
+        default=QApair.default_generation_api_base(),
         help="OpenAI-compatible endpoint used for QA generation.",
     )
     parser.add_argument("--num-pairs", type=int, default=10, help="QA pairs requested per context window.")
@@ -146,11 +148,11 @@ def parse_args():
         help="Maximum contexts used from each document. Default uses the full document.",
     )
     parser.add_argument("--max-retries", type=int, default=2, help="Retries for malformed QA generation output.")
-    parser.add_argument("--collection", help="Qdrant collection name for optional ingestion.")
+    parser.add_argument("--collection", help="pgvector namespace for optional ingestion.")
     parser.add_argument(
-        "--ingest-to-qdrant",
+        "--ingest-to-pgvector",
         action="store_true",
-        help="Ingest the held-out documents into the provided Qdrant collection before evaluation.",
+        help="Ingest the held-out documents into the provided pgvector namespace before evaluation.",
     )
     return parser.parse_args()
 
@@ -169,7 +171,7 @@ def main():
         max_contexts_per_document=args.max_contexts_per_document,
         max_retries=args.max_retries,
         collection=args.collection,
-        ingest_to_qdrant=args.ingest_to_qdrant,
+        ingest_to_pgvector=args.ingest_to_pgvector,
     )
     print(json.dumps(summary, indent=2))
 

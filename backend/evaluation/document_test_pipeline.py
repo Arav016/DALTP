@@ -106,17 +106,21 @@ def parse_args():
     parser.add_argument("--input", required=True, help="Path to a new held-out file or directory of files.")
     parser.add_argument("--output-dir", required=True, help="Directory where benchmark, predictions, and reports will be written.")
     parser.add_argument("--base-model", required=True, help="Base Hugging Face model name or path.")
-    parser.add_argument("--qa-generation-model", default="meta-llama/Llama-3.1-8B-Instruct", help="OpenAI-compatible model name used to generate held-out QA benchmark pairs.")
-    parser.add_argument("--qa-api-base", default="http://localhost:8000/v1", help="OpenAI-compatible endpoint used for QA generation.")
+    parser.add_argument(
+        "--qa-generation-model",
+        default=generate_test_benchmark.QApair.default_generation_model(),
+        help="OpenAI-compatible model name used to generate held-out QA benchmark pairs.",
+    )
+    parser.add_argument("--qa-api-base", default=generate_test_benchmark.QApair.default_generation_api_base(), help="OpenAI-compatible endpoint used for QA generation.")
     parser.add_argument("--adapter-path", help="Fine-tuned LoRA adapter path for fine-tuned modes.")
-    parser.add_argument("--collection", help="Qdrant collection name used for RAG retrieval.")
-    parser.add_argument("--ingest-to-qdrant", action="store_true", help="Ingest the held-out documents into the provided Qdrant collection before running RAG modes.")
+    parser.add_argument("--collection", help="pgvector namespace used for RAG retrieval.")
+    parser.add_argument("--ingest-to-pgvector", action="store_true", help="Ingest the held-out documents into the provided pgvector namespace before running RAG modes.")
     parser.add_argument("--num-pairs", type=int, default=10, help="QA pairs requested per context window when building the held-out benchmark.")
     parser.add_argument("--chunk-size", type=int, default=5000, help="Context size for held-out QA generation.")
     parser.add_argument("--chunk-overlap", type=int, default=200, help="Context overlap for held-out QA generation.")
     parser.add_argument("--max-contexts-per-document", type=int, default=None, help="Maximum contexts used from each held-out document. Default uses the full document.")
     parser.add_argument("--max-retries", type=int, default=2, help="Retries for malformed QA generation output.")
-    parser.add_argument("--top-k", type=int, default=3, help="Number of chunks retrieved from Qdrant for RAG modes.")
+    parser.add_argument("--top-k", type=int, default=3, help="Number of chunks retrieved from pgvector storage for RAG modes.")
     parser.add_argument("--max-new-tokens", type=int, default=256, help="Maximum generated answer tokens for prediction runs.")
     parser.add_argument("--temperature", type=float, default=0.0, help="Generation temperature for prediction runs.")
     parser.add_argument("--dtype", choices=["bfloat16", "float16"], default="bfloat16", help="Model loading dtype for prediction runs.")
@@ -150,7 +154,7 @@ def main():
         max_contexts_per_document=args.max_contexts_per_document,
         max_retries=args.max_retries,
         collection=args.collection,
-        ingest_to_qdrant=args.ingest_to_qdrant,
+        ingest_to_pgvector=args.ingest_to_pgvector,
     )
 
     system_prediction_files = {}

@@ -143,6 +143,29 @@ def normalize_entries(entries):
     return normalized
 
 
+def default_generation_api_base() -> str:
+    return os.getenv("OPENROUTER_API_BASE") or "https://openrouter.ai/api/v1"
+
+
+def build_generation_client(api_base=None):
+    return OpenAI(
+        base_url=api_base or default_generation_api_base(),
+        api_key=os.getenv("OPENROUTER_API_KEY") or "EMPTY",
+    )
+
+
+def default_generation_model() -> str:
+    return os.getenv("OPENROUTER_MODEL") or "openrouter/auto"
+
+
+def create_chat_completion(*, client, model_name, messages, temperature):
+    return client.chat.completions.create(
+        model=model_name,
+        temperature=temperature,
+        messages=messages,
+    )
+
+
 def generate_qa_entries(client, model_name, document_text, num_pairs, max_retries):
     prompt = f"""Generate {num_pairs} grounded question-answer pairs based only on the document text.
 Return ONLY valid JSON in this exact format:
@@ -169,8 +192,9 @@ Document text:
 
     last_response_text = ""
     for attempt in range(max_retries):
-        response = client.chat.completions.create(
-            model=model_name,
+        response = create_chat_completion(
+            client=client,
+            model_name=model_name,
             temperature=0.2,
             messages=[
                 {
@@ -211,8 +235,10 @@ Document text:
 def build_qa_dataset(
     input_path,
     output_path,
-    model_name="meta-llama/Llama-3.1-8B-Instruct",
-    api_base="http://localhost:8000/v1",
+    model_name=(
+        default_generation_model()
+    ),
+    api_base=default_generation_api_base(),
     num_pairs=10,
     chunk_size=5000,
     chunk_overlap=200,
@@ -230,10 +256,7 @@ def build_qa_dataset(
     output_file = Path(output_path).resolve()
     output_file.parent.mkdir(parents=True, exist_ok=True)
 
-    client = OpenAI(
-        base_url=api_base,
-        api_key=os.getenv("OPENAI_API_KEY", "EMPTY"),
-    )
+    client = build_generation_client(api_base=api_base)
 
     records_written = 0
     with output_file.open("w", encoding="utf-8") as file_handle:
@@ -275,19 +298,19 @@ def build_qa_dataset(
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Generate a QA dataset from source documents using an OpenAI-compatible LLM endpoint."
+        description="Generate a QA dataset from source documents using OpenRouter."
     )
     parser.add_argument("--input", required=True, help="Path to a file or directory of source documents.")
     parser.add_argument("--output", required=True, help="Path to the merged QA JSONL output.")
     parser.add_argument(
         "--model",
-        default="meta-llama/Llama-3.1-8B-Instruct",
-        help="Model served by your OpenAI-compatible endpoint.",
+        default=default_generation_model(),
+        help="Model slug served through OpenRouter.",
     )
     parser.add_argument(
         "--api-base",
-        default="http://localhost:8000/v1",
-        help="Base URL for the OpenAI-compatible endpoint.",
+        default=default_generation_api_base(),
+        help="Base URL for the OpenRouter API.",
     )
     parser.add_argument("--num-pairs", type=int, default=10, help="Target QA pairs to request per context window.")
     parser.add_argument("--chunk-size", type=int, default=5000, help="Context window size for each generation call.")
