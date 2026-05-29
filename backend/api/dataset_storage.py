@@ -23,8 +23,8 @@ def _normalize_supabase_url(value: str) -> str:
 
 
 SUPABASE_URL = _normalize_supabase_url(os.getenv("SUPABASE_URL") or "")
-SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_SERVICE_KEY") or ""
-SUPABASE_DATASETS_BUCKET = os.getenv("SUPABASE_DATASETS_BUCKET") or "datasets"
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or ""
+SUPABASE_DATASETS_BUCKET = os.getenv("SUPABASE_DATASETS_BUCKET") or ""
 
 
 def is_supabase_dataset_storage_enabled() -> bool:

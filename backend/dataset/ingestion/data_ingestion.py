@@ -1,5 +1,6 @@
 import argparse
 import csv
+import json
 import fitz
 from backend.dataset.ingestion import embed_db
 from backend.dataset.ingestion import embeddings as embed
@@ -50,6 +51,56 @@ def ingest_documents(
         embed_db.upsert(collection_name, batch, embeddings)
 
     return {"documents_processed": len(documents),
+        "chunks_created": len(chunks),
+        "collection_name": collection_name,
+    }
+
+
+def ingest_jsonl_dataset(
+    input_path,
+    collection_name,
+    batch_size=64,
+):
+    path = Path(input_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Input path does not exist: {path}")
+
+    chunks = []
+    with path.open("r", encoding="utf-8") as file_handle:
+        for line_number, line in enumerate(file_handle, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid JSONL at {path}:{line_number}: {exc}") from exc
+
+            text = " ".join(str(record.get("text") or record.get("content") or "").split()).strip()
+            if not text:
+                continue
+            chunks.append(
+                {
+                    "text": text,
+                    "source": record.get("source") or record.get("file_name") or str(path),
+                    "file_name": record.get("file_name") or path.name,
+                    "page": record.get("page") or record.get("chunk_id") or line_number,
+                }
+            )
+
+    if not chunks:
+        raise ValueError(f"No usable text records found in '{input_path}'.")
+
+    first_embedding = embed.generate_embeddings([chunks[0]["text"]])[0]
+    embed_db.check_collection(collection_name, len(first_embedding))
+
+    for batch in batched(chunks, batch_size):
+        texts = [chunk["text"] for chunk in batch]
+        embeddings = embed.generate_embeddings(texts)
+        embed_db.upsert(collection_name, batch, embeddings)
+
+    return {
+        "documents_processed": len({chunk["file_name"] for chunk in chunks}),
         "chunks_created": len(chunks),
         "collection_name": collection_name,
     }

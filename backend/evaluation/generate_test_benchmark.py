@@ -67,6 +67,91 @@ def build_benchmark_from_qa_file(qa_dataset_path, benchmark_output_path):
     return benchmark_records
 
 
+def build_grouped_documents_from_corpus_records(corpus_records):
+    grouped = {}
+    for record in corpus_records:
+        source = record.get("source") or record.get("file_name") or "corpus-source"
+        grouped.setdefault(
+            source,
+            {
+                "source": source,
+                "file_name": record.get("file_name", ""),
+                "segments": [],
+            },
+        )
+        grouped[source]["segments"].append(
+            {
+                "page": record.get("page", ""),
+                "text": str(record.get("text", "")).strip(),
+            }
+        )
+
+    normalized = []
+    for item in grouped.values():
+        ordered_segments = sorted(item["segments"], key=lambda segment: QApair.page_sort_key(segment["page"]))
+        full_text = "\n\n".join(segment["text"] for segment in ordered_segments if segment["text"])
+        if not full_text:
+            continue
+        normalized.append(
+            {
+                "source": item["source"],
+                "file_name": item["file_name"] or Path(item["source"]).name,
+                "text": full_text,
+            }
+        )
+    return normalized
+
+
+def build_qa_dataset_from_grouped_documents(
+    grouped_documents,
+    qa_dataset_path,
+    qa_generation_model,
+    qa_api_base,
+    num_pairs,
+    chunk_size,
+    chunk_overlap,
+    max_contexts_per_document,
+    max_retries,
+):
+    output_file = Path(qa_dataset_path)
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    client = QApair.build_generation_client(api_base=qa_api_base)
+
+    records_written = 0
+    with output_file.open("w", encoding="utf-8") as file_handle:
+        for document in grouped_documents:
+            text = document["text"].strip()
+            if not text:
+                continue
+
+            if len(text) <= chunk_size:
+                contexts = [text]
+            else:
+                contexts = data_ingestion.split_text(text, chunk_size, chunk_overlap)
+                if max_contexts_per_document is not None and max_contexts_per_document > 0:
+                    contexts = contexts[:max_contexts_per_document]
+
+            for context in contexts:
+                _, _, entries = QApair.generate_qa_entries(
+                    client=client,
+                    model_name=qa_generation_model,
+                    document_text=context,
+                    num_pairs=num_pairs,
+                    max_retries=max_retries,
+                )
+                for entry in entries:
+                    file_handle.write(
+                        json.dumps(QApair.build_qa_record(document, entry["question"], entry["answer"]), ensure_ascii=False) + "\n"
+                    )
+                    records_written += 1
+
+    return {
+        "documents_processed": len(grouped_documents),
+        "records_written": records_written,
+        "output_path": str(output_file),
+    }
+
+
 def maybe_ingest_documents(input_path, collection_name, ingest_to_pgvector):
     if not ingest_to_pgvector:
         return
@@ -83,6 +168,7 @@ def generate_test_benchmark(
     input_path,
     qa_dataset_path,
     benchmark_path,
+    corpus_jsonl_path=None,
     qa_generation_model=None,
     qa_api_base=QApair.default_generation_api_base(),
     num_pairs=10,
@@ -95,23 +181,42 @@ def generate_test_benchmark(
 ):
     if qa_generation_model is None:
         qa_generation_model = QApair.default_generation_model()
-    maybe_ingest_documents(
-        input_path=input_path,
-        collection_name=collection,
-        ingest_to_pgvector=ingest_to_pgvector,
-    )
+    if not input_path and not corpus_jsonl_path:
+        raise ValueError("Provide either input_path or corpus_jsonl_path for benchmark generation.")
+    if corpus_jsonl_path:
+        corpus_records = load_jsonl(corpus_jsonl_path)
+        grouped_documents = build_grouped_documents_from_corpus_records(corpus_records)
+        if not grouped_documents:
+            raise ValueError("No usable grouped documents were reconstructed from the corpus dataset.")
+        build_qa_dataset_from_grouped_documents(
+            grouped_documents=grouped_documents,
+            qa_dataset_path=qa_dataset_path,
+            qa_generation_model=qa_generation_model,
+            qa_api_base=qa_api_base,
+            num_pairs=num_pairs,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            max_contexts_per_document=max_contexts_per_document,
+            max_retries=max_retries,
+        )
+    else:
+        maybe_ingest_documents(
+            input_path=input_path,
+            collection_name=collection,
+            ingest_to_pgvector=ingest_to_pgvector,
+        )
 
-    QApair.build_qa_dataset(
-        input_path=input_path,
-        output_path=qa_dataset_path,
-        model_name=qa_generation_model,
-        api_base=qa_api_base,
-        num_pairs=num_pairs,
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
-        max_contexts_per_document=max_contexts_per_document,
-        max_retries=max_retries,
-    )
+        QApair.build_qa_dataset(
+            input_path=input_path,
+            output_path=qa_dataset_path,
+            model_name=qa_generation_model,
+            api_base=qa_api_base,
+            num_pairs=num_pairs,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            max_contexts_per_document=max_contexts_per_document,
+            max_retries=max_retries,
+        )
 
     benchmark_records = build_benchmark_from_qa_file(qa_dataset_path, benchmark_path)
     return {
@@ -125,7 +230,8 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Generate a held-out QA dataset and benchmark file from new test documents."
     )
-    parser.add_argument("--input", required=True, help="Path to a new held-out file or directory of files.")
+    parser.add_argument("--input", help="Path to a new held-out file or directory of files.")
+    parser.add_argument("--corpus-jsonl", help="Path to a stored corpus dataset JSONL file.")
     parser.add_argument("--qa-output", required=True, help="Output JSONL path for generated QA pairs.")
     parser.add_argument("--benchmark-output", required=True, help="Output JSONL path for the benchmark file.")
     parser.add_argument(
@@ -159,10 +265,13 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if not args.input and not args.corpus_jsonl:
+        raise ValueError("Provide either --input or --corpus-jsonl.")
     summary = generate_test_benchmark(
         input_path=args.input,
         qa_dataset_path=args.qa_output,
         benchmark_path=args.benchmark_output,
+        corpus_jsonl_path=args.corpus_jsonl,
         qa_generation_model=args.qa_generation_model,
         qa_api_base=args.qa_api_base,
         num_pairs=args.num_pairs,

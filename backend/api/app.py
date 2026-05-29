@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import io
 import json
 import os
+import re
 import secrets
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import traceback
 import zipfile
@@ -15,12 +18,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from backend.api import db_store, dataset_storage
+from backend.api import bundle_storage, db_store, dataset_storage, evaluation_storage, model_storage
 from backend.dataset.dataset_construction import Instruction_set, QApair, raw_data
 from backend.dataset.ingestion import data_ingestion
-from fastapi import Depends, FastAPI, Header, HTTPException
+from backend.evaluation import generate_test_benchmark
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 
@@ -42,6 +46,7 @@ TRAINING_CONFIG_PATH = BACKEND_DIR / "training" / "configs" / "lora_llama3_8b_in
 LOCAL_COMMANDS_PATH = ROOT_DIR / "local_run_commands.md"
 DEFAULT_GENERATION_API_BASE = QApair.default_generation_api_base()
 DEFAULT_GENERATION_MODEL = QApair.default_generation_model()
+DEFAULT_EVALUATION_OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL") or "meta-llama/llama-3.1-8b-instruct"
 UPLOADED_DATASET_EXTENSIONS = {".json", ".jsonl", ".csv", ".txt"}
 
 class RegisterPayload(BaseModel):
@@ -72,8 +77,9 @@ class DatasetUploadPayload(BaseModel):
 
 class DatasetGeneratePayload(BaseModel):
     name: str = Field(min_length=2, max_length=120)
-    kind: str = Field(pattern="^(qa|instruction|corpus)$")
-    files: list[DatasetUploadFile] = Field(min_length=1)
+    kind: str = Field(pattern="^(qa|instruction|benchmark|corpus)$")
+    files: list[DatasetUploadFile] = Field(default_factory=list)
+    corpusDatasetId: str | None = None
     chunkSize: int = 1000
     chunkOverlap: int = 150
     qaNumPairs: int = 4
@@ -94,6 +100,16 @@ class DatasetVectorIngestPayload(BaseModel):
     collectionName: str = Field(min_length=2, max_length=120)
     chunkSize: int = 1000
     chunkOverlap: int = 150
+
+
+class BenchmarkGenerationPayload(BaseModel):
+    name: str = Field(min_length=2, max_length=120)
+    qaGenerationModel: str = DEFAULT_GENERATION_MODEL
+    qaApiBase: str = DEFAULT_GENERATION_API_BASE
+    numPairs: int = 10
+    chunkSize: int = 5000
+    chunkOverlap: int = 200
+    maxContextsPerDocument: int | None = None
 
 
 class ManualConfigPayload(BaseModel):
@@ -131,9 +147,10 @@ class ModelImportPayload(BaseModel):
 
 class EvaluationJobPayload(BaseModel):
     runName: str = Field(min_length=2, max_length=120)
-    benchmarkMode: str = Field(pattern="^(existing|generate)$")
+    benchmarkMode: str = Field(default="existing", pattern="^(existing|generate)$")
     benchmarkDatasetId: str | None = None
     corpusDatasetId: str | None = None
+    modelId: str | None = None
     runBase: bool = True
     runRag: bool = True
     runFineTuned: bool = True
@@ -148,10 +165,16 @@ class EvaluationJobPayload(BaseModel):
     chunkOverlap: int = 200
 
 
+def cors_allowed_origins() -> list[str]:
+    configured = os.getenv("DALTP_CORS_ORIGINS") or ""
+    origins = [origin.strip() for origin in configured.split(",") if origin.strip()]
+    return origins or ["http://localhost:5173", "http://127.0.0.1:5173"]
+
+
 app = FastAPI(title="DALTP API", version="0.2.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=cors_allowed_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -198,13 +221,26 @@ def training_output_dir_for_execution(run_name: str, execution_mode: str) -> str
     return str(Path("outputs") / run_slug)
 
 
+def default_evaluation_openrouter_model() -> str:
+    return os.getenv("OPENROUTER_MODEL") or DEFAULT_EVALUATION_OPENROUTER_MODEL
+
+
+def default_evaluation_openrouter_api_base() -> str:
+    return os.getenv("OPENROUTER_API_BASE") or DEFAULT_GENERATION_API_BASE
+
+
+def modal_evaluation_endpoint() -> str:
+    return os.getenv("MODAL_EVAL_ENDPOINT") or ""
+
+
+def openrouter_eval_api_key_configured() -> bool:
+    return bool(os.getenv("OPENROUTER_API_KEY"))
+
+
 def ensure_runtime_dirs() -> None:
-    for path in (AUTH_DIR, DATASETS_DIR, BUNDLES_DIR, JOBS_DIR, MODELS_DIR):
-        path.mkdir(parents=True, exist_ok=True)
-    if not USERS_FILE.exists():
-        USERS_FILE.write_text("[]", encoding="utf-8")
-    if not SESSIONS_FILE.exists():
-        SESSIONS_FILE.write_text("{}", encoding="utf-8")
+    # Runtime directories are legacy local-dev scratch only. Deployment state lives
+    # in Postgres and configured object storage.
+    return None
 
 
 def load_json(path: Path, default: Any) -> Any:
@@ -239,6 +275,11 @@ def safe_read_text(path: Path) -> str:
     if not path.exists():
         return ""
     return path.read_text(encoding="utf-8")
+
+
+def remove_tree_if_exists(path: Path) -> None:
+    if path.exists() and path.is_dir():
+        shutil.rmtree(path, ignore_errors=True)
 
 
 def upload_bytes(upload: DatasetUploadFile) -> bytes:
@@ -326,9 +367,10 @@ def list_uploaded_datasets(user_id: str) -> list[dict[str, Any]]:
     for dataset in datasets:
         if dataset.get("lineCount") is not None and dataset.get("sizeMb") is not None:
             continue
-        data_file = Path(dataset["path"])
-        dataset["lineCount"] = line_count(data_file)
-        dataset["sizeMb"] = file_size_mb(data_file)
+        payload = dataset_storage.download_dataset_artifact_bytes(dataset)
+        text = payload.decode("utf-8", errors="ignore")
+        dataset["lineCount"] = sum(1 for line in text.splitlines() if line.strip())
+        dataset["sizeMb"] = round(len(payload) / (1024 * 1024), 2)
         db_store.upsert_dataset(dataset)
     return datasets
 
@@ -361,8 +403,8 @@ def bundle_run_name_exists(user_id: str, run_name: str) -> bool:
 def evaluation_run_name_exists(user_id: str, run_name: str) -> bool:
     target = normalized_name(run_name)
     return any(
-        normalized_name(load_run_manifest(path).get("runName", "")) == target
-        for path in list_run_dirs_for_user(user_id)
+        normalized_name(load_run_manifest(run).get("runName", run.get("runName", ""))) == target
+        for run in list_runs_for_user(user_id)
     )
 
 
@@ -429,11 +471,14 @@ def delete_run_bundle(bundle_id: str, user: dict[str, Any]) -> None:
     if not bundle_row:
         raise HTTPException(status_code=404, detail="Run bundle not found for this account.")
 
-    bundle_dir = Path(bundle_row["bundleDir"])
-    archive_path = Path(bundle_row["archivePath"])
-    if bundle_dir.exists() and bundle_dir.is_dir():
-        shutil.rmtree(bundle_dir)
-    archive_path.unlink(missing_ok=True)
+    if bundle_row.get("storageProvider") == "supabase":
+        bundle_storage.delete_bundle_archive(bundle_row)
+    else:
+        bundle_dir = Path(bundle_row["bundleDir"])
+        archive_path = Path(bundle_row["archivePath"])
+        if bundle_dir.exists() and bundle_dir.is_dir():
+            shutil.rmtree(bundle_dir)
+        archive_path.unlink(missing_ok=True)
     db_store.delete_bundle(bundle_id, user["id"])
 
 
@@ -442,11 +487,17 @@ def delete_model_artifact(model_id: str, user: dict[str, Any]) -> None:
     if not model:
         raise HTTPException(status_code=404, detail="Model artifact not found for this account.")
 
-    model_dir = Path(model["modelDir"])
-    archive_path = Path(model["archivePath"])
-    if model_dir.exists() and model_dir.is_dir():
-        shutil.rmtree(model_dir)
-    archive_path.unlink(missing_ok=True)
+    if (model.get("storageProvider") or "azure_blob") == "azure_blob":
+        model_storage.delete_model_archive(model)
+    else:
+        archive_path_value = model.get("archivePath")
+        if archive_path_value:
+            Path(archive_path_value).unlink(missing_ok=True)
+    model_dir_value = model.get("modelDir")
+    if model_dir_value:
+        model_dir = Path(model_dir_value)
+        if model_dir.exists() and model_dir.is_dir():
+            shutil.rmtree(model_dir, ignore_errors=True)
     db_store.delete_model(model_id, user["id"])
 
 
@@ -481,7 +532,10 @@ def load_model_manifest(model_dir: Path) -> dict[str, Any]:
 def list_model_artifacts(user_id: str) -> list[dict[str, Any]]:
     artifacts: list[dict[str, Any]] = []
     for model in db_store.list_models(user_id):
-        archive = Path(model["archivePath"])
+        archive_size_mb = model.get("archiveSizeMb")
+        if archive_size_mb is None:
+            total_size = sum(int(file.get("size") or 0) for file in model.get("files", []))
+            archive_size_mb = round(total_size / (1024 * 1024), 2)
         artifacts.append(
             {
                 "id": model["id"],
@@ -491,21 +545,27 @@ def list_model_artifacts(user_id: str) -> list[dict[str, Any]]:
                 "peftMethod": model.get("peftMethod", "qlora"),
                 "loraRank": model.get("loraRank"),
                 "runName": model.get("runName"),
+                "storageProvider": model.get("storageProvider", "azure_blob"),
+                "storageBucket": model.get("storageBucket", ""),
+                "archivePath": model.get("archivePath"),
                 "ownerId": user_id,
                 "createdAt": model.get("createdAt", now_iso()),
                 "fileCount": len(model.get("files", [])),
-                "archiveSizeMb": file_size_mb(archive),
+                "archiveSizeMb": archive_size_mb,
                 "downloadUrl": f"/api/models/{model['id']}/download",
             }
         )
     return artifacts
 
 
-def model_artifact_by_id(model_id: str, user_id: str) -> tuple[dict[str, Any], Path]:
+def model_artifact_by_id(model_id: str, user_id: str) -> dict[str, Any]:
     model = db_store.get_model(model_id, user_id)
     if not model:
         raise HTTPException(status_code=404, detail="Model artifact not found for this account.")
-    model_dir = Path(model["modelDir"])
+    archive_size_mb = model.get("archiveSizeMb")
+    if archive_size_mb is None:
+        total_size = sum(int(file.get("size") or 0) for file in model.get("files", []))
+        archive_size_mb = round(total_size / (1024 * 1024), 2)
     artifact = {
         "id": model["id"],
         "name": model["name"],
@@ -514,13 +574,17 @@ def model_artifact_by_id(model_id: str, user_id: str) -> tuple[dict[str, Any], P
         "peftMethod": model.get("peftMethod", "qlora"),
         "loraRank": model.get("loraRank"),
         "runName": model.get("runName"),
+        "storageProvider": model.get("storageProvider", "azure_blob"),
+        "storageBucket": model.get("storageBucket", ""),
+        "archivePath": model.get("archivePath"),
+        "modelDir": model.get("modelDir"),
         "ownerId": user_id,
         "createdAt": model.get("createdAt", now_iso()),
         "fileCount": len(model.get("files", [])),
         "downloadUrl": f"/api/models/{model_id}/download",
-        "archiveSizeMb": file_size_mb(model_dir.with_suffix(".zip")),
+        "archiveSizeMb": archive_size_mb,
     }
-    return artifact, model_dir
+    return artifact
 
 
 def model_artifact_name_exists(user_id: str, model_name: str) -> bool:
@@ -535,50 +599,183 @@ def build_directory_archive(source_dir: Path, archive_path: Path) -> None:
                 archive.write(file_path, file_path.relative_to(source_dir))
 
 
-def import_model_artifact(payload: ModelImportPayload, user: dict[str, Any]) -> dict[str, Any]:
-    model_name = payload.name.strip()
+def persist_evaluation_run_artifact(
+    *,
+    run_id: str,
+    user: dict[str, Any],
+    run_name: str,
+    run_dir: Path,
+    manifest: dict[str, Any],
+    summary: dict[str, Any] | None,
+    created_at: str,
+) -> dict[str, Any]:
+    evaluation_storage.require_supabase_evaluation_storage()
+    archive_path = run_dir.with_suffix(".zip")
+    build_directory_archive(run_dir, archive_path)
+    storage_metadata = evaluation_storage.upload_evaluation_archive(
+        archive_path,
+        user_id=user["id"],
+        run_id=run_id,
+    )
+    db_store.upsert_eval_run(
+        run_id=run_id,
+        owner_id=user["id"],
+        run_name=run_name,
+        created_at=created_at,
+        updated_at=now_iso(),
+        created_by=user["email"],
+        run_dir="",
+        storage_provider=storage_metadata["storageProvider"],
+        storage_bucket=storage_metadata["storageBucket"],
+        archive_path=storage_metadata["archivePath"],
+        manifest=manifest,
+        summary=summary,
+    )
+    archive_path.unlink(missing_ok=True)
+    remove_tree_if_exists(run_dir)
+    return storage_metadata
+
+
+def create_model_import_workspace(
+    *,
+    user: dict[str, Any],
+    model_name: str,
+    source: str,
+    base_model: str,
+    peft_method: str,
+    lora_rank: int | None,
+) -> tuple[str, Path, Path, dict[str, Any]]:
+    model_name = model_name.strip()
     if model_artifact_name_exists(user["id"], model_name):
         raise HTTPException(status_code=400, detail=f"A model artifact named '{model_name}' already exists in this account.")
 
     artifact_id = f"model-{slugify(model_name)}-{datetime.now().strftime('%Y%m%d%H%M%S')}"
-    model_dir = user_models_dir(user["id"]) / artifact_id
+    model_dir = Path(tempfile.mkdtemp(prefix=f"daltp_models_{user['id']}_")) / artifact_id
     model_dir.mkdir(parents=True, exist_ok=True)
     files_dir = model_dir / "artifact_files"
     files_dir.mkdir(parents=True, exist_ok=True)
 
-    saved_files: list[dict[str, Any]] = []
-    for index, upload in enumerate(payload.files):
-        file_name = upload.name or f"artifact-{index}"
-        relative_path = normalize_relative_path(upload.relativePath, file_name)
-        target_path = files_dir / relative_path
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        target_path.write_bytes(upload_bytes(upload))
-        saved_files.append(
-            {
-                "name": file_name,
-                "relativePath": relative_path.as_posix(),
-                "size": upload.size or len(upload_bytes(upload)),
-                "mimeType": upload.mimeType,
-            }
-        )
-
     manifest = {
         "id": artifact_id,
         "name": model_name,
-        "source": payload.source,
-        "baseModel": payload.baseModel.strip(),
-        "peftMethod": payload.peftMethod,
-        "loraRank": payload.loraRank,
+        "source": source,
+        "baseModel": base_model.strip(),
+        "peftMethod": peft_method,
+        "loraRank": lora_rank,
         "ownerId": user["id"],
         "createdAt": now_iso(),
         "runName": None,
-        "files": saved_files,
     }
+    return artifact_id, model_dir, files_dir, manifest
+
+
+def finalize_model_import(model_dir: Path, manifest: dict[str, Any], saved_files: list[dict[str, Any]], user_id: str) -> dict[str, Any]:
+    manifest["files"] = saved_files
     write_model_manifest(model_dir, manifest)
-    db_store.upsert_model({**manifest, "modelDir": str(model_dir), "archivePath": str(model_dir.with_suffix(".zip"))})
-    build_directory_archive(files_dir, model_dir.with_suffix(".zip"))
-    artifact, _ = model_artifact_by_id(artifact_id, user["id"])
+    archive_path = model_dir.with_suffix(".zip")
+    build_directory_archive(model_dir / "artifact_files", archive_path)
+    storage_metadata = model_storage.upload_model_archive(
+        archive_path,
+        user_id=user_id,
+        model_id=manifest["id"],
+    )
+    archive_size_mb = round(archive_path.stat().st_size / (1024 * 1024), 2)
+    db_store.upsert_model(
+        {
+            **manifest,
+            "storageProvider": storage_metadata["storageProvider"],
+            "storageBucket": storage_metadata["storageBucket"],
+            "modelDir": "",
+            "archivePath": storage_metadata["archivePath"],
+            "archiveSizeMb": archive_size_mb,
+        }
+    )
+    archive_path.unlink(missing_ok=True)
+    remove_tree_if_exists(model_dir.parent)
+    artifact = model_artifact_by_id(manifest["id"], user_id)
     return artifact
+
+
+def extract_zip_to_model_files(archive_source: Any, files_dir: Path) -> list[dict[str, Any]]:
+    saved_files: list[dict[str, Any]] = []
+    try:
+        with zipfile.ZipFile(archive_source) as archive:
+            for member in archive.infolist():
+                if member.is_dir():
+                    continue
+                relative_path = normalize_relative_path(member.filename, f"artifact-{len(saved_files)}")
+                target_path = files_dir / relative_path
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                target_path.write_bytes(archive.read(member))
+                saved_files.append(
+                    {
+                        "name": Path(relative_path).name,
+                        "relativePath": relative_path.as_posix(),
+                        "size": member.file_size,
+                        "mimeType": None,
+                    }
+                )
+    except zipfile.BadZipFile as exc:
+        raise HTTPException(status_code=400, detail="Uploaded model archive is not a valid zip file.") from exc
+    return saved_files
+
+
+def import_model_artifact(payload: ModelImportPayload, user: dict[str, Any]) -> dict[str, Any]:
+    model_name = payload.name.strip()
+    artifact_id, model_dir, files_dir, manifest = create_model_import_workspace(
+        user=user,
+        model_name=model_name,
+        source=payload.source,
+        base_model=payload.baseModel,
+        peft_method=payload.peftMethod,
+        lora_rank=payload.loraRank,
+    )
+
+    saved_files: list[dict[str, Any]] = []
+    if len(payload.files) == 1 and Path(payload.files[0].name or "").suffix.lower() == ".zip":
+        archive_upload = payload.files[0]
+        archive_bytes = upload_bytes(archive_upload)
+        saved_files = extract_zip_to_model_files(io.BytesIO(archive_bytes), files_dir)
+    else:
+        for index, upload in enumerate(payload.files):
+            file_name = upload.name or f"artifact-{index}"
+            relative_path = normalize_relative_path(upload.relativePath, file_name)
+            target_path = files_dir / relative_path
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            file_bytes = upload_bytes(upload)
+            target_path.write_bytes(file_bytes)
+            saved_files.append(
+                {
+                    "name": file_name,
+                    "relativePath": relative_path.as_posix(),
+                    "size": upload.size or len(file_bytes),
+                    "mimeType": upload.mimeType,
+                }
+            )
+
+    return finalize_model_import(model_dir, manifest, saved_files, user["id"])
+
+
+async def import_model_archive_upload(
+    *,
+    name: str,
+    source: str,
+    base_model: str,
+    peft_method: str,
+    lora_rank: int | None,
+    archive: UploadFile,
+    user: dict[str, Any],
+) -> dict[str, Any]:
+    artifact_id, model_dir, files_dir, manifest = create_model_import_workspace(
+        user=user,
+        model_name=name,
+        source=source,
+        base_model=base_model,
+        peft_method=peft_method,
+        lora_rank=lora_rank,
+    )
+    saved_files = extract_zip_to_model_files(archive.file, files_dir)
+    return finalize_model_import(model_dir, manifest, saved_files, user["id"])
 
 
 def register_local_model_artifact(*, bundle: dict[str, Any], user: dict[str, Any], output_dir: Path) -> dict[str, Any]:
@@ -589,7 +786,7 @@ def register_local_model_artifact(*, bundle: dict[str, Any], user: dict[str, Any
         raise HTTPException(status_code=400, detail=f"Training output directory is missing: {output_dir}")
 
     artifact_id = f"model-{slugify(model_name)}-{datetime.now().strftime('%Y%m%d%H%M%S')}"
-    model_dir = user_models_dir(user["id"]) / artifact_id
+    model_dir = Path(tempfile.mkdtemp(prefix=f"daltp_models_{user['id']}_")) / artifact_id
     model_dir.mkdir(parents=True, exist_ok=True)
     files_dir = model_dir / "artifact_files"
     shutil.copytree(output_dir, files_dir)
@@ -620,57 +817,70 @@ def register_local_model_artifact(*, bundle: dict[str, Any], user: dict[str, Any
         "files": saved_files,
     }
     write_model_manifest(model_dir, manifest)
-    db_store.upsert_model({**manifest, "modelDir": str(model_dir), "archivePath": str(model_dir.with_suffix(".zip"))})
-    build_directory_archive(files_dir, model_dir.with_suffix(".zip"))
-    artifact, _ = model_artifact_by_id(artifact_id, user["id"])
+    archive_path = model_dir.with_suffix(".zip")
+    build_directory_archive(files_dir, archive_path)
+    storage_metadata = model_storage.upload_model_archive(
+        archive_path,
+        user_id=user["id"],
+        model_id=artifact_id,
+    )
+    archive_size_mb = round(archive_path.stat().st_size / (1024 * 1024), 2)
+    db_store.upsert_model(
+        {
+            **manifest,
+            "storageProvider": storage_metadata["storageProvider"],
+            "storageBucket": storage_metadata["storageBucket"],
+            "modelDir": "",
+            "archivePath": storage_metadata["archivePath"],
+            "archiveSizeMb": archive_size_mb,
+        }
+    )
+    archive_path.unlink(missing_ok=True)
+    remove_tree_if_exists(model_dir.parent)
+    artifact = model_artifact_by_id(artifact_id, user["id"])
     return artifact
 
 
 def user_jobs_dir(user_id: str) -> Path:
-    path = JOBS_DIR / user_id
-    path.mkdir(parents=True, exist_ok=True)
-    return path
+    return JOBS_DIR / user_id
 
 
 def list_jobs(user_id: str) -> list[dict[str, Any]]:
     return db_store.list_jobs(user_id)
 
 
-def job_dir(job_id: str, user_id: str) -> Path:
-    path = user_jobs_dir(user_id) / job_id
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="Job not found for this account.")
-    return path
+def job_handle(job_id: str, owner_id: str) -> dict[str, str]:
+    return {"id": job_id, "ownerId": owner_id}
 
 
-def append_job_log(path: Path, text: str) -> None:
-    log_path = path / "job.log"
-    with log_path.open("a", encoding="utf-8") as file_handle:
-        file_handle.write(text)
+def job_id_from_ref(job_ref: dict[str, str] | str) -> str:
+    return job_ref["id"] if isinstance(job_ref, dict) else str(job_ref)
 
 
-def read_job_log(path: Path, max_lines: int = 120) -> str:
-    log_path = path / "job.log"
-    if not log_path.exists():
+def append_job_log(job_ref: dict[str, str], text: str) -> None:
+    db_store.append_job_log(job_ref["id"], job_ref["ownerId"], text, now_iso())
+
+
+def read_job_log(job_ref: dict[str, str], max_lines: int = 120) -> str:
+    job = db_store.get_job(job_ref["id"], job_ref["ownerId"])
+    if not job:
         return ""
-    lines = log_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    lines = str(job.get("logs") or "").splitlines()
     return "\n".join(lines[-max_lines:])
 
 
-def update_job_manifest(path: Path, **changes: Any) -> dict[str, Any]:
-    manifest = load_json(path / "manifest.json", {})
+def update_job_manifest(job_ref: dict[str, str], **changes: Any) -> dict[str, Any]:
+    manifest = db_store.get_job(job_ref["id"], job_ref["ownerId"])
+    if not manifest:
+        raise RuntimeError(f"Job {job_ref['id']} no longer exists.")
     manifest.update(changes)
     manifest["updatedAt"] = now_iso()
-    write_json(path / "manifest.json", manifest)
-    manifest["jobDir"] = str(path)
     db_store.upsert_job(manifest)
     return manifest
 
 
-def create_job(user: dict[str, Any], job_type: str, title: str, metadata: dict[str, Any] | None = None) -> tuple[dict[str, Any], Path]:
+def create_job(user: dict[str, Any], job_type: str, title: str, metadata: dict[str, Any] | None = None) -> tuple[dict[str, Any], dict[str, str]]:
     job_id = f"{job_type}-{datetime.now().strftime('%Y%m%d%H%M%S')}-{secrets.token_hex(4)}"
-    path = user_jobs_dir(user["id"]) / job_id
-    path.mkdir(parents=True, exist_ok=True)
     manifest = {
         "id": job_id,
         "type": job_type,
@@ -680,29 +890,27 @@ def create_job(user: dict[str, Any], job_type: str, title: str, metadata: dict[s
         "createdAt": now_iso(),
         "updatedAt": now_iso(),
         "metadata": metadata or {},
-        "logPath": str(path / "job.log"),
-        "jobDir": str(path),
+        "logs": "",
+        "logPath": f"postgres://daltp_jobs/{job_id}/logs",
+        "jobDir": f"postgres://daltp_jobs/{job_id}",
     }
-    write_json(path / "manifest.json", manifest)
     db_store.upsert_job(manifest)
-    return manifest, path
+    return manifest, job_handle(job_id, user["id"])
 
 
 def get_job_manifest(job_id: str, user: dict[str, Any]) -> dict[str, Any]:
     manifest = db_store.get_job(job_id, user["id"])
     if not manifest:
         raise HTTPException(status_code=404, detail="Job not found for this account.")
-    path = Path(manifest["jobDir"])
-    manifest["logs"] = read_job_log(path)
     return manifest
 
 
-def start_background_job(path: Path, runner) -> None:
-    thread = threading.Thread(target=runner, args=(path,), daemon=True)
+def start_background_job(job_ref: dict[str, str], runner) -> None:
+    thread = threading.Thread(target=runner, args=(job_ref,), daemon=True)
     thread.start()
 
 
-def run_logged_command(command: list[str], *, cwd: Path, path: Path, step_label: str) -> None:
+def run_logged_command(command: list[str], *, cwd: Path, path: dict[str, str], step_label: str) -> None:
     append_job_log(path, f"\n$ {' '.join(command)}\n")
     process = subprocess.Popen(
         command,
@@ -719,6 +927,115 @@ def run_logged_command(command: list[str], *, cwd: Path, path: Path, step_label:
     return_code = process.wait()
     if return_code != 0:
         raise RuntimeError(f"{step_label} failed with exit code {return_code}.")
+
+
+def sanitize_user_visible_error(text: str) -> str:
+    sanitized = str(text or "").strip()
+    if not sanitized:
+        return "The operation failed."
+
+    # Avoid surfacing machine-specific filesystem details directly in user-facing copy.
+    sanitized = re.sub(r"[A-Za-z]:\\\\[^\\s\"]+", "[local path]", sanitized)
+    sanitized = re.sub(r"/(?:[^/\s]+/)+[^/\s]+", "[local path]", sanitized)
+
+    # Avoid accidentally surfacing token-looking strings.
+    sanitized = re.sub(r"\b(?:hf|sk|rk)_[A-Za-z0-9]{12,}\b", "[redacted token]", sanitized)
+    sanitized = re.sub(r"Bearer\s+[A-Za-z0-9._-]+", "Bearer [redacted]", sanitized, flags=re.IGNORECASE)
+
+    return " ".join(sanitized.split())
+
+
+def summarize_evaluation_failure(exc: Exception, job_path: dict[str, str]) -> str:
+    raw_message = str(exc)
+    log_excerpt = read_job_log(job_path, max_lines=80)
+    combined = f"{raw_message}\n{log_excerpt}".lower()
+
+    if "modal evaluation endpoint" in combined or "could not reach the modal evaluation endpoint" in combined:
+        return (
+            "DALTP could not reach the fine-tuned evaluation service. "
+            "Check that the Modal evaluation endpoint is configured and available, then try again."
+        )
+
+    if "modal response" in combined:
+        return (
+            "DALTP received an invalid response from the fine-tuned evaluation service. "
+            "Check the Modal endpoint implementation and try again."
+        )
+
+    if "openrouter" in combined and ("401" in combined or "403" in combined or "api key" in combined or "authentication" in combined):
+        return (
+            "DALTP could not access OpenRouter for evaluation. "
+            "Check the OpenRouter evaluation configuration and try again."
+        )
+
+    if "openrouter" in combined and ("429" in combined or "rate limit" in combined):
+        return (
+            "DALTP hit an OpenRouter rate limit while generating evaluation predictions. "
+            "Try again in a moment or reduce the number of evaluation modes."
+        )
+
+    if "gated repo" in combined or ("401" in combined and "huggingface" in combined) or "repositorynotfounderror" in combined:
+        return (
+            "DALTP could not access the selected Hugging Face base model. "
+            "Make sure the Modal evaluation environment has permission to that model."
+        )
+
+    if "not a valid model identifier" in combined or "could not find" in combined and "hugging face" in combined:
+        return (
+            "DALTP could not find the selected base model. "
+            "Check that the chosen model artifact points to a valid Hugging Face model name."
+        )
+
+    if "cuda out of memory" in combined or "outofmemoryerror" in combined or "not enough memory" in combined:
+        return (
+            "Evaluation ran out of memory while loading or running the selected model. "
+            "Try fewer evaluation modes, a smaller model, or a machine with more GPU/RAM."
+        )
+
+    if "bitsandbytes" in combined or "4-bit" in combined:
+        if "cuda" in combined or "gpu" in combined or "compiled without gpu support" in combined:
+            return (
+                "Evaluation could not start 4-bit model loading on this machine. "
+                "Run evaluation on a machine with compatible GPU/CUDA support."
+            )
+
+    if "adapter-path" in combined or "adapter" in combined and ("does not exist" in combined or "not found" in combined):
+        return (
+            "DALTP could not load the selected fine-tuned model files. "
+            "Re-import the model artifact and try again."
+        )
+
+    if "benchmark generation failed" in combined or "held-out benchmark" in combined:
+        return (
+            "DALTP could not generate a benchmark dataset from the selected corpus dataset. "
+            "Check that the stored corpus dataset contains usable text and that benchmark generation is configured correctly."
+        )
+
+    if "prediction generation (base)" in combined:
+        return (
+            "DALTP could not complete base-model prediction generation for this evaluation run. "
+            "Check the OpenRouter evaluation configuration and try again."
+        )
+
+    if "prediction generation (rag)" in combined:
+        return (
+            "DALTP could not complete RAG prediction generation for this evaluation run. "
+            "Check that the selected corpus has been ingested into pgvector and that OpenRouter evaluation is configured correctly."
+        )
+
+    if "prediction generation (fine_tuned" in combined:
+        return (
+            "DALTP could not complete fine-tuned prediction generation for this evaluation run. "
+            "Check the selected model artifact and the Modal evaluation service, then try again."
+        )
+
+    if "evaluation scoring failed" in combined:
+        return (
+            "DALTP generated predictions but could not finish scoring them. "
+            "Open the job details if you need the backend log for troubleshooting."
+        )
+
+    return sanitize_user_visible_error(raw_message)
 
 
 def load_users() -> list[dict[str, Any]]:
@@ -784,52 +1101,25 @@ def get_current_user(authorization: str | None = Header(default=None)) -> dict[s
     return user
 
 
-def get_run_dir(run_id: str) -> Path:
-    return EVAL_OUTPUTS_DIR / run_id
-
-
-def list_run_dirs() -> list[Path]:
-    if not EVAL_OUTPUTS_DIR.exists():
-        return []
-    return sorted([path for path in EVAL_OUTPUTS_DIR.iterdir() if path.is_dir()], reverse=True)
-
-
-def load_run_manifest(run_dir: Path) -> dict[str, Any]:
-    payload = load_json(run_dir / RUN_MANIFEST_FILE, {})
+def load_run_manifest(run: dict[str, Any]) -> dict[str, Any]:
+    payload = run.get("manifest") or {}
     return payload if isinstance(payload, dict) else {}
 
 
-def run_dir_for_user(run_id: str, user_id: str) -> Path:
+def run_record_for_user(run_id: str, user_id: str) -> dict[str, Any]:
     run_entry = db_store.get_eval_run(run_id, user_id)
     if not run_entry:
         raise HTTPException(status_code=404, detail="Run not found.")
-    run_dir = Path(run_entry["runDir"])
-    if not run_dir.exists():
-        raise HTTPException(status_code=404, detail="Run not found for this account.")
-    return run_dir
+    return run_entry
 
 
-def list_run_dirs_for_user(user_id: str) -> list[Path]:
-    visible_runs: list[Path] = []
-    for run in db_store.list_eval_runs(user_id):
-        run_dir = Path(run["runDir"])
-        if run_dir.exists():
-            visible_runs.append(run_dir)
-    return visible_runs
+def list_runs_for_user(user_id: str) -> list[dict[str, Any]]:
+    return db_store.list_eval_runs(user_id)
 
 
-def find_scored_dir(run_dir: Path) -> Path:
-    scored_dir = run_dir / "scored"
-    if scored_dir.exists():
-        return scored_dir
-    return run_dir
-
-
-def summary_from_run(run_dir: Path) -> dict[str, Any]:
-    scored_dir = find_scored_dir(run_dir)
-    summary_path = scored_dir / "comparison_summary.json"
-    summary_json = load_json(summary_path, {})
-    manifest = load_run_manifest(run_dir)
+def summary_from_run(run: dict[str, Any]) -> dict[str, Any]:
+    summary_json = run.get("summary") or {}
+    manifest = load_run_manifest(run)
     systems = []
     for system_name, metrics in (summary_json.get("systems") or {}).items():
         systems.append(
@@ -840,17 +1130,30 @@ def summary_from_run(run_dir: Path) -> dict[str, Any]:
             }
         )
     return {
-        "runId": run_dir.name,
-        "runName": manifest.get("runName", run_dir.name),
+        "runId": run["id"],
+        "runName": manifest.get("runName", run["runName"]),
         "benchmarkSize": summary_json.get("benchmark_size", 0),
+        "createdAt": run.get("createdAt"),
+        "updatedAt": run.get("updatedAt"),
         "systems": systems,
     }
+
+
+def delete_evaluation_run(run_id: str, user: dict[str, Any]) -> None:
+    run = run_record_for_user(run_id, user["id"])
+    evaluation_storage.delete_evaluation_archive(run)
+    run_dir_value = run.get("runDir")
+    if run_dir_value:
+        run_dir = Path(run_dir_value)
+        if run_dir.exists() and run_dir.is_dir():
+            shutil.rmtree(run_dir, ignore_errors=True)
+    db_store.delete_eval_run(run_id, user["id"])
 
 
 def list_bundles(user_id: str) -> list[dict[str, Any]]:
     bundles: list[dict[str, Any]] = []
     for bundle in db_store.list_bundles(user_id):
-        archive = Path(bundle["archivePath"])
+        archive = Path(bundle["archivePath"] or "")
         bundles.append(
             {
                 "id": bundle["id"],
@@ -863,7 +1166,7 @@ def list_bundles(user_id: str) -> list[dict[str, Any]]:
                 "instructionDatasetId": bundle.get("instructionDatasetId"),
                 "configMode": bundle.get("configMode"),
                 "createdAt": bundle.get("createdAt", now_iso()),
-                "archiveSizeMb": file_size_mb(archive),
+                "archiveSizeMb": file_size_mb(archive) if archive.exists() else 0,
                 "commands": bundle.get("commands", {"local": [], "colab": []}),
                 "downloadUrl": f"/api/run-bundles/{bundle['id']}/download",
             }
@@ -875,7 +1178,8 @@ def bundle_by_id(bundle_id: str, user_id: str) -> tuple[dict[str, Any], Path]:
     bundle_row = db_store.get_bundle(bundle_id, user_id)
     if not bundle_row:
         raise HTTPException(status_code=404, detail="Run bundle not found for this account.")
-    bundle_dir = Path(bundle_row["bundleDir"])
+    bundle_dir_value = bundle_row.get("bundleDir") or ""
+    bundle_dir = Path(bundle_dir_value) if bundle_dir_value else Path()
     bundle = {
         "id": bundle_row["id"],
         "runName": bundle_row["runName"],
@@ -889,7 +1193,10 @@ def bundle_by_id(bundle_id: str, user_id: str) -> tuple[dict[str, Any], Path]:
         "createdAt": bundle_row.get("createdAt", now_iso()),
         "commands": bundle_row.get("commands", {"local": [], "colab": []}),
         "downloadUrl": f"/api/run-bundles/{bundle_id}/download",
-        "archiveSizeMb": file_size_mb(bundle_dir.with_suffix(".zip")),
+        "storageProvider": bundle_row.get("storageProvider"),
+        "storageBucket": bundle_row.get("storageBucket", ""),
+        "archivePath": bundle_row.get("archivePath"),
+        "archiveSizeMb": file_size_mb(bundle_dir.with_suffix(".zip")) if bundle_dir_value else 0,
     }
     return bundle, bundle_dir
 
@@ -955,34 +1262,38 @@ def preset_by_id(preset_id: str | None) -> dict[str, Any] | None:
 
 
 def build_dashboard_payload(user: dict[str, Any]) -> dict[str, Any]:
-    run_dirs = list_run_dirs_for_user(user["id"])
+    runs = list_runs_for_user(user["id"])
+    scored_runs = []
     recent_runs = []
     best_bert = 0.0
-    for run_dir in run_dirs:
-        summary = summary_from_run(run_dir)
-        manifest = load_run_manifest(run_dir)
+    for run in runs:
+        summary = summary_from_run(run)
+        manifest = load_run_manifest(run)
         systems = summary["systems"]
+        if not systems:
+            continue
+        scored_runs.append(run)
         best_system = max(systems, key=lambda system: system["metrics"].get("BERTScore F1", 0), default=None)
         if best_system:
             best_bert = max(best_bert, best_system["metrics"].get("BERTScore F1", 0))
         recent_runs.append(
             {
-                "id": run_dir.name,
-                "name": manifest.get("runName", run_dir.name),
+                "id": run["id"],
+                "name": manifest.get("runName", run["runName"]),
                 "model": "Llama 3.1 8B",
                 "status": "Done" if systems else "Pending",
                 "progress": 100 if systems else 0,
                 "metric": f"{best_system['metrics'].get('ROUGE-L', 0):.4f}" if best_system else "--",
                 "metricLabel": f"best ROUGE-L ({best_system['name'].replace('_', ' ')})" if best_system else "awaiting scored outputs",
                 "benchmarkSize": summary.get("benchmarkSize", 0),
-                "updatedAt": datetime.fromtimestamp(run_dir.stat().st_mtime, timezone.utc).isoformat(),
+                "updatedAt": run.get("updatedAt") or run.get("createdAt"),
             }
         )
 
     workspace = workspace_summary_for_user(user)
     return {
         "stats": [
-            {"label": "Evaluation runs", "value": len(run_dirs), "subtext": "saved DALTP output runs", "tone": "green"},
+            {"label": "Scored runs", "value": len(scored_runs), "subtext": "completed evaluation reports", "tone": "green"},
             {"label": "Best BERTScore F1", "value": f"{best_bert:.4f}" if best_bert else "0.0000", "subtext": "across scored runs", "tone": "green"},
             {"label": "My datasets", "value": len(dataset_catalog(user)), "subtext": f"{workspace['uploadedDatasetCount']} uploaded by you", "tone": "green"},
             {"label": "Prepared bundles", "value": workspace["bundleCount"], "subtext": "local + Colab launch packages", "tone": "amber"},
@@ -1002,81 +1313,72 @@ def create_uploaded_dataset(payload: DatasetUploadPayload, user: dict[str, Any])
         raise HTTPException(status_code=400, detail=f"A dataset named '{dataset_name}' already exists in this account.")
     validate_uploaded_dataset_files(payload.files)
 
-    owner_dir = DATASETS_DIR / user["id"]
-    owner_dir.mkdir(parents=True, exist_ok=True)
     dataset_id = f"user-{slugify(dataset_name)}-{datetime.now().strftime('%Y%m%d%H%M%S')}"
-    dataset_dir = owner_dir / dataset_id
-    dataset_dir.mkdir(parents=True, exist_ok=True)
-    source_dir = dataset_dir / "source_files"
-    source_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="daltp_dataset_") as temp_dir:
+        dataset_dir = Path(temp_dir) / dataset_id
+        dataset_dir.mkdir(parents=True, exist_ok=True)
 
-    saved_files = []
-    combined_chunks: list[str] = []
-    first_extension = ".txt"
-    for index, upload in enumerate(payload.files):
-        file_name = upload.name or f"{payload.kind}-{index}.txt"
-        relative_path = normalize_relative_path(upload.relativePath, file_name)
-        target_path = source_dir / relative_path
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        target_path.write_bytes(upload_bytes(upload))
-        content = upload_text(upload).rstrip()
-        if content:
-            combined_chunks.append(content)
-        saved_files.append(
-            {
-                "name": file_name,
-                "relativePath": relative_path.as_posix(),
-                "size": upload.size or len(upload_bytes(upload)),
-                "mimeType": upload.mimeType,
-            }
+        saved_files = []
+        combined_chunks: list[str] = []
+        first_extension = ".txt"
+        for index, upload in enumerate(payload.files):
+            file_name = upload.name or f"{payload.kind}-{index}.txt"
+            relative_path = normalize_relative_path(upload.relativePath, file_name)
+            content = upload_text(upload).rstrip()
+            if content:
+                combined_chunks.append(content)
+            saved_files.append(
+                {
+                    "name": file_name,
+                    "relativePath": relative_path.as_posix(),
+                    "size": upload.size or len(upload_bytes(upload)),
+                    "mimeType": upload.mimeType,
+                }
+            )
+
+            extension = Path(file_name).suffix.lower()
+            if index == 0 and extension in {".jsonl", ".json", ".csv", ".txt"}:
+                first_extension = extension
+
+        stored_file_name = f"dataset{first_extension or '.txt'}"
+        combined_path = dataset_dir / stored_file_name
+        combined_payload = "\n".join(chunk for chunk in combined_chunks if chunk)
+        if combined_payload and not combined_payload.endswith("\n"):
+            combined_payload += "\n"
+        combined_path.write_text(combined_payload, encoding="utf-8")
+
+        manifest = {
+            "id": dataset_id,
+            "name": dataset_name,
+            "kind": payload.kind,
+            "description": f"User-uploaded {payload.kind} dataset.",
+            "source": "uploaded",
+            "ownerId": user["id"],
+            "storedFileName": stored_file_name,
+            "createdAt": now_iso(),
+            "files": saved_files,
+            "vectorStore": None,
+        }
+        combined_line_count = line_count(combined_path)
+        combined_size_mb = file_size_mb(combined_path)
+        storage_metadata = dataset_storage.upload_dataset_artifact(
+            combined_path,
+            user_id=user["id"],
+            dataset_id=dataset_id,
+            stored_file_name=stored_file_name,
+            mime_type="text/plain",
         )
-
-        extension = Path(file_name).suffix.lower()
-        if index == 0 and extension in {".jsonl", ".json", ".csv", ".txt"}:
-            first_extension = extension
-
-    stored_file_name = f"dataset{first_extension or '.txt'}"
-    combined_path = dataset_dir / stored_file_name
-    combined_payload = "\n".join(chunk for chunk in combined_chunks if chunk)
-    if combined_payload and not combined_payload.endswith("\n"):
-        combined_payload += "\n"
-    combined_path.write_text(combined_payload, encoding="utf-8")
-
-    manifest = {
-        "id": dataset_id,
-        "name": dataset_name,
-        "kind": payload.kind,
-        "description": f"User-uploaded {payload.kind} dataset.",
-        "source": "uploaded",
-        "ownerId": user["id"],
-        "storedFileName": stored_file_name,
-        "createdAt": now_iso(),
-        "files": saved_files,
-        "vectorStore": None,
-    }
-    write_dataset_manifest(dataset_dir, manifest)
-    combined_line_count = line_count(combined_path)
-    combined_size_mb = file_size_mb(combined_path)
-    storage_metadata = dataset_storage.upload_dataset_artifact(
-        combined_path,
-        user_id=user["id"],
-        dataset_id=dataset_id,
-        stored_file_name=stored_file_name,
-        mime_type="text/plain",
-    )
-    manifest.update(storage_metadata)
-    write_dataset_manifest(dataset_dir, manifest)
+        manifest.update(storage_metadata)
     db_store.upsert_dataset(
         {
             **manifest,
             "path": storage_metadata["path"],
-            "datasetDir": str(dataset_dir),
+            "datasetDir": "",
             "lineCount": combined_line_count,
             "sizeMb": combined_size_mb,
             "generator": None,
         }
     )
-    combined_path.unlink(missing_ok=True)
 
     return {
         "id": dataset_id,
@@ -1121,12 +1423,30 @@ def create_source_documents(files: list[DatasetUploadFile], target_dir: Path, fa
 
 def create_generated_dataset(payload: DatasetGeneratePayload, user: dict[str, Any]) -> dict[str, Any]:
     dataset_storage.require_supabase_dataset_storage()
+    if payload.kind == "benchmark":
+        if not payload.corpusDatasetId:
+            raise HTTPException(status_code=400, detail="Choose a corpus dataset before generating a benchmark dataset.")
+        return create_benchmark_dataset_from_corpus(
+            payload.corpusDatasetId,
+            BenchmarkGenerationPayload(
+                name=payload.name,
+                qaGenerationModel=payload.modelName,
+                qaApiBase=payload.apiBase,
+                numPairs=payload.qaNumPairs,
+                chunkSize=payload.qaChunkSize,
+                chunkOverlap=payload.qaChunkOverlap,
+                maxContextsPerDocument=payload.qaMaxContextsPerDocument,
+            ),
+            user,
+        )
+
     dataset_name = payload.name.strip()
     if dataset_name_exists(user, dataset_name):
         raise HTTPException(status_code=400, detail=f"A dataset named '{dataset_name}' already exists in this account.")
+    if not payload.files:
+        raise HTTPException(status_code=400, detail="Choose source documents before generating a dataset.")
 
-    owner_dir = DATASETS_DIR / user["id"]
-    owner_dir.mkdir(parents=True, exist_ok=True)
+    owner_dir = Path(tempfile.mkdtemp(prefix=f"daltp_datasets_{user['id']}_"))
     dataset_id = f"user-{slugify(dataset_name)}-{datetime.now().strftime('%Y%m%d%H%M%S')}"
     dataset_dir = owner_dir / dataset_id
     dataset_dir.mkdir(parents=True, exist_ok=True)
@@ -1194,6 +1514,34 @@ def create_generated_dataset(payload: DatasetGeneratePayload, user: dict[str, An
             "chunkOverlap": payload.qaChunkOverlap,
             "maxContextsPerDocument": payload.qaMaxContextsPerDocument,
         }
+    elif payload.kind == "benchmark":
+        held_out_qa_path = dataset_dir / "held_out_qa_dataset.jsonl"
+        try:
+            generate_test_benchmark.generate_test_benchmark(
+                input_path=str(source_root),
+                qa_dataset_path=str(held_out_qa_path),
+                benchmark_path=str(output_path),
+                qa_generation_model=payload.modelName,
+                qa_api_base=payload.apiBase,
+                num_pairs=payload.qaNumPairs,
+                chunk_size=payload.qaChunkSize,
+                chunk_overlap=payload.qaChunkOverlap,
+                max_contexts_per_document=payload.qaMaxContextsPerDocument,
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=clarify_generation_error(exc, payload.apiBase, "benchmark"),
+            ) from exc
+        held_out_qa_path.unlink(missing_ok=True)
+        generator_settings = {
+            "modelName": payload.modelName,
+            "apiBase": payload.apiBase,
+            "numPairs": payload.qaNumPairs,
+            "chunkSize": payload.qaChunkSize,
+            "chunkOverlap": payload.qaChunkOverlap,
+            "maxContextsPerDocument": payload.qaMaxContextsPerDocument,
+        }
     else:
         try:
             Instruction_set.build_instruction_dataset(
@@ -1252,13 +1600,13 @@ def create_generated_dataset(payload: DatasetGeneratePayload, user: dict[str, An
         {
             **manifest,
             "path": storage_metadata["path"],
-            "datasetDir": str(dataset_dir),
+            "datasetDir": "",
             "lineCount": output_line_count,
             "sizeMb": output_size_mb,
             "generator": manifest["generator"],
         }
     )
-    output_path.unlink(missing_ok=True)
+    remove_tree_if_exists(owner_dir)
 
     return {
         "id": dataset_id,
@@ -1278,27 +1626,167 @@ def create_generated_dataset(payload: DatasetGeneratePayload, user: dict[str, An
     }
 
 
+def create_benchmark_dataset_from_corpus(
+    corpus_dataset_id: str,
+    payload: BenchmarkGenerationPayload,
+    user: dict[str, Any],
+) -> dict[str, Any]:
+    dataset_storage.require_supabase_dataset_storage()
+    corpus_dataset = dataset_by_id(corpus_dataset_id, user)
+    if corpus_dataset["kind"] != "corpus":
+        raise HTTPException(status_code=400, detail="Only corpus datasets can be used to generate benchmark datasets.")
+
+    dataset_name = payload.name.strip()
+    if dataset_name_exists(user, dataset_name):
+        raise HTTPException(status_code=400, detail=f"A dataset named '{dataset_name}' already exists in this account.")
+
+    owner_dir = Path(tempfile.mkdtemp(prefix=f"daltp_datasets_{user['id']}_"))
+    dataset_id = f"user-{slugify(dataset_name)}-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+    dataset_dir = owner_dir / dataset_id
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+
+    corpus_jsonl_path = dataset_dir / "corpus_dataset.jsonl"
+    qa_output_path = dataset_dir / "held_out_qa_dataset.jsonl"
+    benchmark_output_path = dataset_dir / "benchmark.jsonl"
+    dataset_storage.copy_dataset_artifact_to_path(corpus_dataset, corpus_jsonl_path)
+
+    try:
+        generate_test_benchmark.generate_test_benchmark(
+            input_path=None,
+            corpus_jsonl_path=str(corpus_jsonl_path),
+            qa_dataset_path=str(qa_output_path),
+            benchmark_path=str(benchmark_output_path),
+            qa_generation_model=payload.qaGenerationModel,
+            qa_api_base=payload.qaApiBase,
+            num_pairs=payload.numPairs,
+            chunk_size=payload.chunkSize,
+            chunk_overlap=payload.chunkOverlap,
+            max_contexts_per_document=payload.maxContextsPerDocument,
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=clarify_generation_error(exc, payload.qaApiBase, "benchmark"),
+        ) from exc
+
+    saved_files = [
+        {
+            "name": corpus_dataset["name"],
+            "datasetId": corpus_dataset["id"],
+            "kind": corpus_dataset["kind"],
+            "storageProvider": corpus_dataset.get("storageProvider", "supabase"),
+        }
+    ]
+    manifest = {
+        "id": dataset_id,
+        "name": dataset_name,
+        "kind": "benchmark",
+        "description": f"Generated benchmark dataset from corpus dataset {corpus_dataset['name']}.",
+        "source": "generated",
+        "ownerId": user["id"],
+        "storedFileName": benchmark_output_path.name,
+        "createdAt": now_iso(),
+        "files": saved_files,
+        "vectorStore": None,
+        "generator": {
+            "mode": "benchmark_from_corpus",
+            "sourceDatasetId": corpus_dataset["id"],
+            "sourceDatasetName": corpus_dataset["name"],
+            "settings": {
+                "modelName": payload.qaGenerationModel,
+                "apiBase": payload.qaApiBase,
+                "numPairs": payload.numPairs,
+                "chunkSize": payload.chunkSize,
+                "chunkOverlap": payload.chunkOverlap,
+                "maxContextsPerDocument": payload.maxContextsPerDocument,
+            },
+        },
+    }
+    write_dataset_manifest(dataset_dir, manifest)
+    output_line_count = line_count(benchmark_output_path)
+    output_size_mb = file_size_mb(benchmark_output_path)
+    storage_metadata = dataset_storage.upload_dataset_artifact(
+        benchmark_output_path,
+        user_id=user["id"],
+        dataset_id=dataset_id,
+        stored_file_name=benchmark_output_path.name,
+        mime_type="application/json",
+    )
+    manifest.update(storage_metadata)
+    write_dataset_manifest(dataset_dir, manifest)
+    db_store.upsert_dataset(
+        {
+            **manifest,
+            "path": storage_metadata["path"],
+            "datasetDir": "",
+            "lineCount": output_line_count,
+            "sizeMb": output_size_mb,
+            "generator": manifest["generator"],
+        }
+    )
+
+    remove_tree_if_exists(owner_dir)
+
+    return {
+        "id": dataset_id,
+        "name": manifest["name"],
+        "kind": manifest["kind"],
+        "description": manifest["description"],
+        "source": manifest["source"],
+        "ownerId": user["id"],
+        "path": storage_metadata["path"],
+        "lineCount": output_line_count,
+        "sizeMb": output_size_mb,
+        "createdAt": manifest["createdAt"],
+        "files": saved_files,
+        "vectorStore": manifest["vectorStore"],
+        "storageProvider": manifest.get("storageProvider", "supabase"),
+        "storageBucket": manifest.get("storageBucket", ""),
+    }
+
+
 def ingest_dataset_to_vector_store(dataset_id: str, payload: DatasetVectorIngestPayload, user: dict[str, Any]) -> dict[str, Any]:
     dataset = dataset_by_id(dataset_id, user)
     if dataset["kind"] != "corpus":
         raise HTTPException(status_code=400, detail="Only corpus datasets can be ingested into pgvector storage.")
 
-    dataset_dir = uploaded_dataset_dir(dataset_id, user)
-    manifest = load_json(dataset_dir / "manifest.json", {})
-    manifest["vectorStore"] = ingest_dataset_source_to_vector_store(
-        dataset_dir=dataset_dir,
-        dataset_name=dataset["name"],
-        user=user,
-        collection_name=payload.collectionName.strip(),
-        chunk_size=payload.chunkSize,
-        chunk_overlap=payload.chunkOverlap,
-    )
-    write_dataset_manifest(dataset_dir, manifest)
+    with tempfile.TemporaryDirectory(prefix="daltp_pgvector_") as temp_dir:
+        corpus_path = Path(temp_dir) / "corpus.jsonl"
+        dataset_storage.copy_dataset_artifact_to_path(dataset, corpus_path)
+        ingest_summary = data_ingestion.ingest_jsonl_dataset(
+            input_path=str(corpus_path),
+            collection_name=payload.collectionName.strip(),
+        )
+
+    manifest = {
+        "id": dataset["id"],
+        "name": dataset["name"],
+        "kind": dataset["kind"],
+        "description": dataset.get("description", ""),
+        "source": dataset.get("source", "generated"),
+        "ownerId": user["id"],
+        "storedFileName": dataset.get("storedFileName") or Path(dataset["path"]).name,
+        "createdAt": dataset.get("createdAt", now_iso()),
+        "files": dataset.get("files", []),
+        "generator": dataset.get("generator"),
+        "vectorStore": {
+            "ingested": True,
+            "collectionName": payload.collectionName.strip(),
+            "chunkSize": payload.chunkSize,
+            "chunkOverlap": payload.chunkOverlap,
+            "documentsProcessed": ingest_summary.get("documents_processed", 0),
+            "chunksCreated": ingest_summary.get("chunks_created", 0),
+            "ingestedAt": now_iso(),
+            "ingestedBy": user["id"],
+            "datasetName": dataset["name"],
+            "backend": "pgvector",
+        },
+    }
     db_store.upsert_dataset(
         {
             **manifest,
             "path": dataset["path"],
-            "datasetDir": str(dataset_dir),
+            "datasetDir": "",
             "lineCount": dataset.get("lineCount"),
             "sizeMb": dataset.get("sizeMb"),
             "storageProvider": dataset.get("storageProvider", "supabase"),
@@ -1424,12 +1912,12 @@ def build_config_from_payload(payload: RunBundlePayload, copied_datasets: list[d
 
 
 def create_bundle_manifest(payload: RunBundlePayload, user: dict[str, Any]) -> dict[str, Any]:
+    bundle_storage.require_supabase_bundle_storage()
     run_name = payload.runName.strip()
     if bundle_run_name_exists(user["id"], run_name):
         raise HTTPException(status_code=400, detail=f"A prepared run named '{run_name}' already exists in this account.")
 
-    owner_dir = BUNDLES_DIR / user["id"]
-    owner_dir.mkdir(parents=True, exist_ok=True)
+    owner_dir = Path(tempfile.mkdtemp(prefix=f"daltp_bundles_{user['id']}_"))
 
     bundle_id = f"{slugify(run_name)}-{datetime.now().strftime('%Y%m%d%H%M%S')}"
     bundle_dir = owner_dir / bundle_id
@@ -1488,19 +1976,27 @@ def create_bundle_manifest(payload: RunBundlePayload, user: dict[str, Any]) -> d
         "instructions": instructions,
     }
     write_json(bundle_dir / "manifest.json", manifest)
-    db_store.upsert_bundle(
-        {
-            **manifest,
-            "bundleDir": str(bundle_dir),
-            "archivePath": str(bundle_dir.with_suffix(".zip")),
-        }
-    )
-
     archive_path = bundle_dir.with_suffix(".zip")
     with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as archive:
         for file_path in bundle_dir.rglob("*"):
             if file_path.is_file():
                 archive.write(file_path, file_path.relative_to(bundle_dir))
+    storage_metadata = bundle_storage.upload_bundle_archive(
+        archive_path,
+        user_id=user["id"],
+        bundle_id=bundle_id,
+    )
+    db_store.upsert_bundle(
+        {
+            **manifest,
+            "bundleDir": "",
+            "archivePath": storage_metadata["archivePath"],
+            "storageProvider": storage_metadata["storageProvider"],
+            "storageBucket": storage_metadata["storageBucket"],
+        }
+    )
+    archive_size_mb = file_size_mb(archive_path)
+    remove_tree_if_exists(owner_dir)
 
     return {
         "id": bundle_id,
@@ -1513,7 +2009,7 @@ def create_bundle_manifest(payload: RunBundlePayload, user: dict[str, Any]) -> d
         "instructionDatasetId": manifest["instructionDatasetId"],
         "configMode": manifest["configMode"],
         "createdAt": manifest["createdAt"],
-        "archiveSizeMb": file_size_mb(archive_path),
+        "archiveSizeMb": archive_size_mb,
         "commands": manifest["commands"],
         "downloadUrl": f"/api/run-bundles/{bundle_id}/download",
     }
@@ -1536,7 +2032,7 @@ def start_dataset_generation_job(payload: DatasetGeneratePayload, user: dict[str
             append_job_log(job_path, f"Completed dataset generation for {dataset['name']}.\n")
         except Exception as exc:
             append_job_log(job_path, traceback.format_exc() + "\n")
-            update_job_manifest(job_path, status="failed", error=str(exc))
+            update_job_manifest(job_path, status="failed", error=summarize_evaluation_failure(exc, job_path))
 
     start_background_job(path, runner)
     return job
@@ -1577,23 +2073,37 @@ def start_local_training_job(bundle_id: str, user: dict[str, Any]) -> dict[str, 
         f"Train {bundle['runName']}",
         {"bundleId": bundle_id, "runName": bundle["runName"]},
     )
-    config_path = bundle_dir / "training_config.json"
-
-    def runner(job_path: Path) -> None:
+    def runner(job_path: dict[str, str]) -> None:
         update_job_manifest(job_path, status="running")
         append_job_log(job_path, f"Starting local training for bundle {bundle['runName']}...\n")
         try:
-            run_logged_command(
-                [sys.executable, "-m", "backend.training.trainer", "--config", str(config_path)],
-                cwd=ROOT_DIR,
-                path=job_path,
-                step_label="Local training",
-            )
-            config_payload = load_json(config_path, {})
-            output_dir = Path(config_payload.get("training", {}).get("output_dir", ""))
-            if output_dir and not output_dir.is_absolute():
-                output_dir = (config_path.parent / output_dir).resolve()
-            artifact = register_local_model_artifact(bundle=bundle, user=user, output_dir=output_dir)
+            temp_root = Path(tempfile.mkdtemp(prefix="daltp_training_bundle_"))
+            try:
+                if bundle.get("storageProvider") == "supabase":
+                    archive_path = temp_root / "bundle.zip"
+                    archive_path.write_bytes(bundle_storage.download_bundle_archive_bytes(bundle))
+                    with zipfile.ZipFile(archive_path) as archive:
+                        archive.extractall(temp_root)
+                    config_path = temp_root / "training_config.json"
+                else:
+                    config_path = bundle_dir / "training_config.json"
+
+                if not config_path.exists():
+                    raise FileNotFoundError("The selected run bundle is missing training_config.json.")
+
+                run_logged_command(
+                    [sys.executable, "-m", "backend.training.trainer", "--config", str(config_path)],
+                    cwd=ROOT_DIR,
+                    path=job_path,
+                    step_label="Local training",
+                )
+                config_payload = load_json(config_path, {})
+                output_dir = Path(config_payload.get("training", {}).get("output_dir", ""))
+                if output_dir and not output_dir.is_absolute():
+                    output_dir = (config_path.parent / output_dir).resolve()
+                artifact = register_local_model_artifact(bundle=bundle, user=user, output_dir=output_dir)
+            finally:
+                remove_tree_if_exists(temp_root)
             update_job_manifest(job_path, status="completed", result={"bundleId": bundle_id, "model": artifact})
             append_job_log(job_path, f"Local training completed. Registered model artifact '{artifact['name']}'.\n")
         except Exception as exc:
@@ -1620,87 +2130,132 @@ def start_evaluation_job(payload: EvaluationJobPayload, user: dict[str, Any]) ->
 
     corpus_dataset = dataset_by_id(payload.corpusDatasetId, user) if payload.corpusDatasetId else None
     collection_name = corpus_dataset.get("vectorStore", {}).get("collectionName") if corpus_dataset else None
+    selected_model = None
+    if any(mode in {"fine_tuned", "fine_tuned_rag"} for mode in selected_modes):
+        if not payload.modelId:
+            raise HTTPException(status_code=400, detail="Choose a model artifact for fine-tuned evaluation.")
+        selected_model = model_artifact_by_id(payload.modelId, user["id"])
+        if (selected_model.get("storageProvider") or "azure_blob") != "azure_blob" or not selected_model.get("archivePath"):
+            raise HTTPException(
+                status_code=400,
+                detail="The selected model artifact is missing its Azure-backed adapter archive. Re-import the model so DALTP can use it for fine-tuned evaluation.",
+            )
+    elif payload.modelId:
+        selected_model = model_artifact_by_id(payload.modelId, user["id"])
+
     if any(mode in {"rag", "fine_tuned_rag"} for mode in selected_modes) and not collection_name:
         raise HTTPException(status_code=400, detail="RAG evaluation needs a corpus dataset that has been ingested into pgvector storage.")
-    if payload.benchmarkMode == "existing" and not payload.benchmarkDatasetId:
-        raise HTTPException(status_code=400, detail="Choose an existing benchmark dataset.")
-    if payload.benchmarkMode == "generate" and not payload.corpusDatasetId:
-        raise HTTPException(status_code=400, detail="Choose a corpus dataset to generate a benchmark from.")
+    if not payload.benchmarkDatasetId:
+        raise HTTPException(status_code=400, detail="Choose a benchmark dataset.")
     if evaluation_run_name_exists(user["id"], run_name):
         raise HTTPException(status_code=400, detail=f"An evaluation run named '{run_name}' already exists.")
+    if any(mode in {"base", "rag"} for mode in selected_modes) and not openrouter_eval_api_key_configured():
+        raise HTTPException(
+            status_code=400,
+            detail="Configure OpenRouter evaluation access before running base or RAG evaluation.",
+        )
+    if any(mode in {"fine_tuned", "fine_tuned_rag"} for mode in selected_modes) and not modal_evaluation_endpoint():
+        raise HTTPException(
+            status_code=400,
+            detail="Configure a Modal evaluation endpoint before running fine-tuned evaluation.",
+        )
 
     run_id = f"{slugify(run_name)}-{datetime.now().strftime('%Y%m%d%H%M%S')}"
-    run_dir = EVAL_OUTPUTS_DIR / run_id
+    run_dir = Path(tempfile.mkdtemp(prefix=f"daltp_eval_{user['id']}_")) / run_id
+    created_at = now_iso()
+    openrouter_eval_model = default_evaluation_openrouter_model()
     job, path = create_job(
         user,
         "evaluation",
         f"Evaluate {run_name}",
-        {"runId": run_id, "modes": selected_modes, "benchmarkMode": payload.benchmarkMode},
+        {
+            "runId": run_id,
+            "modes": selected_modes,
+            "benchmarkMode": "existing",
+            "selectedModes": selected_modes,
+            "completedModes": [],
+            "currentStep": "queued",
+            "totalModes": len(selected_modes),
+            "benchmarkDatasetId": payload.benchmarkDatasetId,
+            "corpusDatasetId": payload.corpusDatasetId,
+            "modelId": selected_model["id"] if selected_model else None,
+            "modelName": selected_model["name"] if selected_model else None,
+            "providers": {
+                "base": "openrouter" if payload.runBase else None,
+                "rag": "openrouter" if payload.runRag else None,
+                "fineTuned": "modal" if payload.runFineTuned else None,
+                "fineTunedRag": "modal" if payload.runFineTunedRag else None,
+            },
+        },
     )
 
     def runner(job_path: Path) -> None:
-        update_job_manifest(job_path, status="running")
-        run_dir.mkdir(parents=True, exist_ok=True)
-        write_json(
-            run_dir / RUN_MANIFEST_FILE,
-            {
-                "id": run_id,
-                "runName": run_name,
-                "ownerId": user["id"],
-                "createdAt": now_iso(),
-                "createdBy": user["email"],
-                "type": "evaluation",
+        base_metadata = {
+            "runId": run_id,
+            "modes": selected_modes,
+            "benchmarkMode": "existing",
+            "selectedModes": selected_modes,
+            "completedModes": [],
+            "currentStep": "running",
+            "totalModes": len(selected_modes),
+            "benchmarkDatasetId": payload.benchmarkDatasetId,
+            "corpusDatasetId": payload.corpusDatasetId,
+            "modelId": selected_model["id"] if selected_model else None,
+            "modelName": selected_model["name"] if selected_model else None,
+            "providers": {
+                "base": "openrouter" if payload.runBase else None,
+                "rag": "openrouter" if payload.runRag else None,
+                "fineTuned": "modal" if payload.runFineTuned else None,
+                "fineTunedRag": "modal" if payload.runFineTunedRag else None,
             },
-        )
+        }
+        update_job_manifest(job_path, status="running", metadata=base_metadata)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        run_manifest = {
+            "id": run_id,
+            "runName": run_name,
+            "ownerId": user["id"],
+            "createdAt": created_at,
+            "createdBy": user["email"],
+            "type": "evaluation",
+            "modelId": selected_model["id"] if selected_model else None,
+            "modelName": selected_model["name"] if selected_model else None,
+            "providers": {
+                "base": "openrouter" if "base" in selected_modes else None,
+                "rag": "openrouter" if "rag" in selected_modes else None,
+                "fineTuned": "modal" if "fine_tuned" in selected_modes else None,
+                "fineTunedRag": "modal" if "fine_tuned_rag" in selected_modes else None,
+            },
+        }
+        write_json(run_dir / RUN_MANIFEST_FILE, run_manifest)
         db_store.upsert_eval_run(
             run_id=run_id,
             owner_id=user["id"],
             run_name=run_name,
-            created_at=now_iso(),
+            created_at=created_at,
+            updated_at=created_at,
             created_by=user["email"],
             run_dir=str(run_dir),
+            manifest=run_manifest,
         )
         benchmark_path = run_dir / "benchmark.jsonl"
         qa_output_path = run_dir / "held_out_qa_dataset.jsonl"
         prediction_files: dict[str, Path] = {}
+        base_model_name = (selected_model or {}).get("baseModel") or "meta-llama/Meta-Llama-3.1-8B-Instruct"
         try:
-            if payload.benchmarkMode == "existing":
-                benchmark_dataset = dataset_by_id(payload.benchmarkDatasetId or "", user)
-                shutil.copy2(benchmark_dataset["path"], benchmark_path)
-                append_job_log(job_path, f"Using existing benchmark dataset {benchmark_dataset['name']}.\n")
-            else:
-                corpus_dir = uploaded_dataset_dir(payload.corpusDatasetId or "", user)
-                source_root = corpus_dir / "source_files"
-                append_job_log(job_path, "Generating held-out benchmark from source documents...\n")
-                run_logged_command(
-                    [
-                        sys.executable,
-                        "-m",
-                        "backend.evaluation.generate_test_benchmark",
-                        "--input",
-                        str(source_root),
-                        "--qa-output",
-                        str(qa_output_path),
-                        "--benchmark-output",
-                        str(benchmark_path),
-                        "--qa-generation-model",
-                        payload.qaGenerationModel,
-                        "--qa-api-base",
-                        payload.qaApiBase,
-                        "--num-pairs",
-                        str(payload.numPairs),
-                        "--chunk-size",
-                        str(payload.chunkSize),
-                        "--chunk-overlap",
-                        str(payload.chunkOverlap),
-                    ],
-                    cwd=ROOT_DIR,
-                    path=job_path,
-                    step_label="Benchmark generation",
-                )
+            adapter_url = None
+            if selected_model and any(mode in {"fine_tuned", "fine_tuned_rag"} for mode in selected_modes):
+                adapter_url = model_storage.create_model_archive_signed_url(selected_model)
+
+            benchmark_dataset = dataset_by_id(payload.benchmarkDatasetId or "", user)
+            dataset_storage.copy_dataset_artifact_to_path(benchmark_dataset, benchmark_path)
+            append_job_log(job_path, f"Using existing benchmark dataset {benchmark_dataset['name']}.\n")
 
             for mode in selected_modes:
+                base_metadata["currentStep"] = f"running_{mode}"
+                update_job_manifest(job_path, metadata=base_metadata)
                 output_path = run_dir / f"{mode}_predictions.jsonl"
+                provider = "modal" if mode in {"fine_tuned", "fine_tuned_rag"} else "openrouter"
                 command = [
                     sys.executable,
                     "-m",
@@ -1713,24 +2268,54 @@ def start_evaluation_job(payload: EvaluationJobPayload, user: dict[str, Any]) ->
                     f"{mode}_model",
                     "--mode",
                     mode,
+                    "--provider",
+                    provider,
                     "--base-model",
-                    "meta-llama/Meta-Llama-3.1-8B-Instruct",
+                    base_model_name,
                     "--top-k",
                     str(payload.topK),
                     "--max-new-tokens",
                     str(payload.maxNewTokens),
                     "--temperature",
                     str(payload.temperature),
-                    "--load-in-4bit",
                 ]
+                if provider == "openrouter":
+                    command.extend(
+                        [
+                            "--remote-model",
+                            openrouter_eval_model,
+                            "--api-base",
+                            default_evaluation_openrouter_api_base(),
+                        ]
+                    )
                 if mode in {"rag", "fine_tuned_rag"}:
                     command.extend(["--collection", collection_name])
                 if mode in {"fine_tuned", "fine_tuned_rag"}:
-                    command.extend(["--adapter-path", str(BACKEND_DIR / "training" / "outputs" / "llama3_8b_sft")])
+                    command.extend(
+                        [
+                            "--model-id",
+                            selected_model["id"],
+                            "--model-artifact-name",
+                            selected_model["name"],
+                            "--adapter-url",
+                            adapter_url,
+                            "--adapter-cache-key",
+                            selected_model["archivePath"],
+                            "--peft-method",
+                            selected_model.get("peftMethod") or "qlora",
+                        ]
+                    )
+                    if selected_model.get("loraRank") is not None:
+                        command.extend(["--lora-rank", str(selected_model["loraRank"])])
                 append_job_log(job_path, f"Running prediction mode {mode}...\n")
                 run_logged_command(command, cwd=ROOT_DIR, path=job_path, step_label=f"Prediction generation ({mode})")
                 prediction_files[mode] = output_path
+                base_metadata["completedModes"] = [*base_metadata["completedModes"], mode]
+                base_metadata["currentStep"] = f"completed_{mode}"
+                update_job_manifest(job_path, metadata=base_metadata)
 
+            base_metadata["currentStep"] = "scoring"
+            update_job_manifest(job_path, metadata=base_metadata)
             compare_command = [
                 sys.executable,
                 "-m",
@@ -1751,15 +2336,39 @@ def start_evaluation_job(payload: EvaluationJobPayload, user: dict[str, Any]) ->
 
             append_job_log(job_path, "Scoring model outputs...\n")
             run_logged_command(compare_command, cwd=ROOT_DIR, path=job_path, step_label="Evaluation scoring")
+            summary_payload = load_json(run_dir / "scored" / "comparison_summary.json", {})
             update_job_manifest(
                 job_path,
                 status="completed",
-                result={"runId": run_id, "outputDir": str(run_dir), "collectionName": collection_name},
+                metadata={**base_metadata, "currentStep": "completed"},
+                result={"runId": run_id, "collectionName": collection_name},
+            )
+            persist_evaluation_run_artifact(
+                run_id=run_id,
+                user=user,
+                run_name=run_name,
+                run_dir=run_dir,
+                manifest=run_manifest,
+                summary=summary_payload if isinstance(summary_payload, dict) else None,
+                created_at=created_at,
             )
             append_job_log(job_path, f"Evaluation completed for run {run_id}.\n")
         except Exception as exc:
             append_job_log(job_path, traceback.format_exc() + "\n")
-            update_job_manifest(job_path, status="failed", error=str(exc))
+            if run_dir.exists():
+                try:
+                    persist_evaluation_run_artifact(
+                        run_id=run_id,
+                        user=user,
+                        run_name=run_name,
+                        run_dir=run_dir,
+                        manifest=run_manifest,
+                        summary=None,
+                        created_at=created_at,
+                    )
+                except Exception as persist_exc:
+                    append_job_log(job_path, f"Failed to persist evaluation artifact: {persist_exc}\n")
+            update_job_manifest(job_path, status="failed", error=summarize_evaluation_failure(exc, job_path))
 
     start_background_job(path, runner)
     return job
@@ -1863,15 +2472,15 @@ def get_dashboard(user: dict[str, Any] = Depends(get_current_user)) -> dict[str,
 @app.get("/api/runs")
 def get_runs(user: dict[str, Any] = Depends(get_current_user)) -> dict[str, Any]:
     runs = []
-    for run_dir in list_run_dirs_for_user(user["id"]):
-        scored_dir = find_scored_dir(run_dir)
-        manifest = load_run_manifest(run_dir)
+    for run in list_runs_for_user(user["id"]):
+        manifest = load_run_manifest(run)
         runs.append(
             {
-                "id": run_dir.name,
-                "name": manifest.get("runName", run_dir.name),
-                "updatedAt": datetime.fromtimestamp(run_dir.stat().st_mtime, timezone.utc).isoformat(),
-                "hasScoredOutputs": (scored_dir / "comparison_summary.json").exists(),
+                "id": run["id"],
+                "name": manifest.get("runName", run["runName"]),
+                "updatedAt": run.get("updatedAt") or run.get("createdAt"),
+                "hasScoredOutputs": bool((run.get("summary") or {}).get("systems")),
+                "downloadUrl": f"/api/runs/{run['id']}/download",
             }
         )
     return {"runs": runs}
@@ -1879,8 +2488,26 @@ def get_runs(user: dict[str, Any] = Depends(get_current_user)) -> dict[str, Any]
 
 @app.get("/api/runs/{run_id}/summary")
 def get_run_summary(run_id: str, user: dict[str, Any] = Depends(get_current_user)) -> dict[str, Any]:
-    run_dir = run_dir_for_user(run_id, user["id"])
-    return summary_from_run(run_dir)
+    run = run_record_for_user(run_id, user["id"])
+    return summary_from_run(run)
+
+
+@app.get("/api/runs/{run_id}/download")
+def download_run_archive(run_id: str, user: dict[str, Any] = Depends(get_current_user)) -> Response:
+    run = run_record_for_user(run_id, user["id"])
+    payload = evaluation_storage.download_evaluation_archive_bytes(run)
+    file_name = f"{slugify(load_run_manifest(run).get('runName', run['runName']))}.zip"
+    return Response(
+        content=payload,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{file_name}"'},
+    )
+
+
+@app.delete("/api/runs/{run_id}")
+def remove_run(run_id: str, user: dict[str, Any] = Depends(get_current_user)) -> dict[str, str]:
+    delete_evaluation_run(run_id, user)
+    return {"status": "deleted"}
 
 
 @app.get("/api/datasets")
@@ -1899,13 +2526,41 @@ def import_model(payload: ModelImportPayload, user: dict[str, Any] = Depends(get
     return {"model": artifact}
 
 
+@app.post("/api/models/import-archive")
+async def import_model_archive(
+    name: str = Form(...),
+    source: str = Form(...),
+    baseModel: str = Form(...),
+    peftMethod: str = Form(...),
+    loraRank: int | None = Form(default=None),
+    archive: UploadFile = File(...),
+    user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    if Path(archive.filename or "").suffix.lower() != ".zip":
+        raise HTTPException(status_code=400, detail="Upload a .zip archive for model import.")
+    artifact = await import_model_archive_upload(
+        name=name,
+        source=source,
+        base_model=baseModel,
+        peft_method=peftMethod,
+        lora_rank=loraRank,
+        archive=archive,
+        user=user,
+    )
+    return {"model": artifact}
+
+
 @app.get("/api/models/{model_id}/download")
-def download_model(model_id: str, user: dict[str, Any] = Depends(get_current_user)) -> FileResponse:
-    artifact, model_dir = model_artifact_by_id(model_id, user["id"])
-    archive = model_dir.with_suffix(".zip")
-    if not archive.exists():
-        raise HTTPException(status_code=404, detail="Model archive is missing.")
-    return FileResponse(path=archive, filename=f"{slugify(artifact['name'])}.zip", media_type="application/zip")
+def download_model(model_id: str, user: dict[str, Any] = Depends(get_current_user)) -> Response:
+    artifact = model_artifact_by_id(model_id, user["id"])
+    if artifact.get("storageProvider") != "azure_blob":
+        raise HTTPException(status_code=404, detail="Model archive is not available in configured Azure storage.")
+    payload = model_storage.download_model_archive_bytes(artifact)
+    return Response(
+        content=payload,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{slugify(artifact["name"])}.zip"'},
+    )
 
 
 @app.delete("/api/models/{model_id}")
@@ -1978,12 +2633,18 @@ def launch_local_bundle(bundle_id: str, user: dict[str, Any] = Depends(get_curre
 
 
 @app.get("/api/run-bundles/{bundle_id}/download")
-def download_run_bundle(bundle_id: str, user: dict[str, Any] = Depends(get_current_user)) -> FileResponse:
-    _bundle, bundle_dir = bundle_by_id(bundle_id, user["id"])
-    archive = bundle_dir.with_suffix(".zip")
-    if not archive.exists():
-        raise HTTPException(status_code=404, detail="Bundle archive is missing.")
-    return FileResponse(path=archive, filename=archive.name, media_type="application/zip")
+def download_run_bundle(bundle_id: str, user: dict[str, Any] = Depends(get_current_user)) -> Response:
+    bundle, _bundle_dir = bundle_by_id(bundle_id, user["id"])
+    if bundle.get("storageProvider") == "supabase":
+        payload = bundle_storage.download_bundle_archive_bytes(bundle)
+        file_name = f"{slugify(bundle['runName'])}.zip"
+        return Response(
+            content=payload,
+            media_type="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="{file_name}"'},
+        )
+
+    raise HTTPException(status_code=404, detail="Run bundle archive is not available in configured Supabase storage.")
 
 
 @app.delete("/api/run-bundles/{bundle_id}")

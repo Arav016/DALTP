@@ -64,6 +64,15 @@ def _read_json(path: Path, default: Any) -> Any:
         return default
 
 
+def _read_text(path: Path) -> str:
+    if not path.exists():
+        return ""
+    try:
+        return path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return ""
+
+
 def ensure_tables() -> None:
     with connection() as conn:
         with conn.cursor() as cur:
@@ -135,12 +144,16 @@ def ensure_tables() -> None:
                     created_at TIMESTAMPTZ NOT NULL,
                     bundle_dir TEXT NOT NULL,
                     archive_path TEXT NOT NULL,
+                    storage_provider TEXT,
+                    storage_bucket TEXT,
                     commands_json TEXT,
                     instructions_json TEXT
                 );
                 """
             )
             cur.execute("CREATE INDEX IF NOT EXISTS idx_daltp_bundles_owner_created ON daltp_bundles (owner_id, created_at DESC);")
+            cur.execute("ALTER TABLE daltp_bundles ADD COLUMN IF NOT EXISTS storage_provider TEXT;")
+            cur.execute("ALTER TABLE daltp_bundles ADD COLUMN IF NOT EXISTS storage_bucket TEXT;")
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS daltp_jobs (
@@ -154,12 +167,14 @@ def ensure_tables() -> None:
                     metadata_json TEXT,
                     result_json TEXT,
                     error TEXT,
+                    logs_text TEXT,
                     log_path TEXT NOT NULL,
                     job_dir TEXT NOT NULL
                 );
                 """
             )
             cur.execute("CREATE INDEX IF NOT EXISTS idx_daltp_jobs_owner_updated ON daltp_jobs (owner_id, updated_at DESC);")
+            cur.execute("ALTER TABLE daltp_jobs ADD COLUMN IF NOT EXISTS logs_text TEXT;")
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS daltp_models (
@@ -174,12 +189,18 @@ def ensure_tables() -> None:
                     bundle_id TEXT,
                     created_at TIMESTAMPTZ NOT NULL,
                     files_json TEXT,
+                    storage_provider TEXT,
+                    storage_bucket TEXT,
                     model_dir TEXT NOT NULL,
-                    archive_path TEXT NOT NULL
+                    archive_path TEXT NOT NULL,
+                    archive_size_mb DOUBLE PRECISION
                 );
                 """
             )
             cur.execute("CREATE INDEX IF NOT EXISTS idx_daltp_models_owner_created ON daltp_models (owner_id, created_at DESC);")
+            cur.execute("ALTER TABLE daltp_models ADD COLUMN IF NOT EXISTS storage_provider TEXT;")
+            cur.execute("ALTER TABLE daltp_models ADD COLUMN IF NOT EXISTS storage_bucket TEXT;")
+            cur.execute("ALTER TABLE daltp_models ADD COLUMN IF NOT EXISTS archive_size_mb DOUBLE PRECISION;")
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS daltp_eval_runs (
@@ -187,12 +208,24 @@ def ensure_tables() -> None:
                     owner_id TEXT NOT NULL REFERENCES daltp_users(id) ON DELETE CASCADE,
                     run_name TEXT NOT NULL,
                     created_at TIMESTAMPTZ NOT NULL,
+                    updated_at TIMESTAMPTZ,
                     created_by TEXT,
-                    run_dir TEXT NOT NULL
+                    run_dir TEXT NOT NULL,
+                    storage_provider TEXT,
+                    storage_bucket TEXT,
+                    archive_path TEXT,
+                    manifest_json TEXT,
+                    summary_json TEXT
                 );
                 """
             )
             cur.execute("CREATE INDEX IF NOT EXISTS idx_daltp_eval_runs_owner_created ON daltp_eval_runs (owner_id, created_at DESC);")
+            cur.execute("ALTER TABLE daltp_eval_runs ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ;")
+            cur.execute("ALTER TABLE daltp_eval_runs ADD COLUMN IF NOT EXISTS storage_provider TEXT;")
+            cur.execute("ALTER TABLE daltp_eval_runs ADD COLUMN IF NOT EXISTS storage_bucket TEXT;")
+            cur.execute("ALTER TABLE daltp_eval_runs ADD COLUMN IF NOT EXISTS archive_path TEXT;")
+            cur.execute("ALTER TABLE daltp_eval_runs ADD COLUMN IF NOT EXISTS manifest_json TEXT;")
+            cur.execute("ALTER TABLE daltp_eval_runs ADD COLUMN IF NOT EXISTS summary_json TEXT;")
 
 
 def upsert_user(user: dict[str, Any]) -> None:
@@ -391,7 +424,7 @@ def list_datasets(owner_id: str) -> list[dict[str, Any]]:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT id, owner_id, name, kind, description, source, stored_file_name, storage_provider, storage_bucket, dataset_path, dataset_dir, created_at, line_count, size_mb, files_json, vector_store_json
+                SELECT id, owner_id, name, kind, description, source, stored_file_name, storage_provider, storage_bucket, dataset_path, dataset_dir, created_at, line_count, size_mb, files_json, generator_json, vector_store_json
                 FROM daltp_datasets
                 WHERE owner_id = %s
                 ORDER BY created_at DESC;
@@ -418,7 +451,8 @@ def list_datasets(owner_id: str) -> list[dict[str, Any]]:
                 "lineCount": row[12],
                 "sizeMb": row[13],
                 "files": _json_load(row[14], []),
-                "vectorStore": _json_load(row[15], None),
+                "generator": _json_load(row[15], None),
+                "vectorStore": _json_load(row[16], None),
             }
         )
     return results
@@ -429,7 +463,7 @@ def get_dataset(dataset_id: str, owner_id: str) -> dict[str, Any] | None:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT id, owner_id, name, kind, description, source, stored_file_name, storage_provider, storage_bucket, dataset_path, dataset_dir, created_at, line_count, size_mb, files_json, vector_store_json
+                SELECT id, owner_id, name, kind, description, source, stored_file_name, storage_provider, storage_bucket, dataset_path, dataset_dir, created_at, line_count, size_mb, files_json, generator_json, vector_store_json
                 FROM daltp_datasets
                 WHERE id = %s AND owner_id = %s
                 LIMIT 1;
@@ -455,7 +489,8 @@ def get_dataset(dataset_id: str, owner_id: str) -> dict[str, Any] | None:
         "lineCount": row[12],
         "sizeMb": row[13],
         "files": _json_load(row[14], []),
-        "vectorStore": _json_load(row[15], None),
+        "generator": _json_load(row[15], None),
+        "vectorStore": _json_load(row[16], None),
     }
 
 
@@ -471,9 +506,9 @@ def upsert_bundle(metadata: dict[str, Any]) -> None:
             cur.execute(
                 """
                 INSERT INTO daltp_bundles
-                    (id, owner_id, run_name, execution_mode, base_model, peft_method, lora_rank, qa_dataset_id, instruction_dataset_id, benchmark_dataset_id, config_mode, preset_id, created_at, bundle_dir, archive_path, commands_json, instructions_json)
+                    (id, owner_id, run_name, execution_mode, base_model, peft_method, lora_rank, qa_dataset_id, instruction_dataset_id, benchmark_dataset_id, config_mode, preset_id, created_at, bundle_dir, archive_path, storage_provider, storage_bucket, commands_json, instructions_json)
                 VALUES
-                    (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (id) DO UPDATE SET
                     owner_id = EXCLUDED.owner_id,
                     run_name = EXCLUDED.run_name,
@@ -489,6 +524,8 @@ def upsert_bundle(metadata: dict[str, Any]) -> None:
                     created_at = EXCLUDED.created_at,
                     bundle_dir = EXCLUDED.bundle_dir,
                     archive_path = EXCLUDED.archive_path,
+                    storage_provider = EXCLUDED.storage_provider,
+                    storage_bucket = EXCLUDED.storage_bucket,
                     commands_json = EXCLUDED.commands_json,
                     instructions_json = EXCLUDED.instructions_json;
                 """,
@@ -508,6 +545,8 @@ def upsert_bundle(metadata: dict[str, Any]) -> None:
                     metadata["createdAt"],
                     metadata["bundleDir"],
                     metadata["archivePath"],
+                    metadata.get("storageProvider"),
+                    metadata.get("storageBucket"),
                     _json_dump(metadata.get("commands", {"local": [], "colab": []})),
                     _json_dump(metadata.get("instructions", {})),
                 ),
@@ -519,7 +558,7 @@ def list_bundles(owner_id: str) -> list[dict[str, Any]]:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT id, run_name, execution_mode, base_model, peft_method, lora_rank, qa_dataset_id, instruction_dataset_id, benchmark_dataset_id, config_mode, created_at, archive_path, commands_json
+                SELECT id, run_name, execution_mode, base_model, peft_method, lora_rank, qa_dataset_id, instruction_dataset_id, benchmark_dataset_id, config_mode, created_at, archive_path, commands_json, storage_provider, storage_bucket
                 FROM daltp_bundles
                 WHERE owner_id = %s
                 ORDER BY created_at DESC;
@@ -541,6 +580,8 @@ def list_bundles(owner_id: str) -> list[dict[str, Any]]:
             "createdAt": row[10].isoformat() if hasattr(row[10], "isoformat") else row[10],
             "archivePath": row[11],
             "commands": _json_load(row[12], {"local": [], "colab": []}),
+            "storageProvider": row[13],
+            "storageBucket": row[14],
         }
         for row in rows
     ]
@@ -551,7 +592,7 @@ def get_bundle(bundle_id: str, owner_id: str) -> dict[str, Any] | None:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT id, run_name, execution_mode, base_model, peft_method, lora_rank, qa_dataset_id, instruction_dataset_id, benchmark_dataset_id, config_mode, created_at, archive_path, commands_json, bundle_dir
+                SELECT id, run_name, execution_mode, base_model, peft_method, lora_rank, qa_dataset_id, instruction_dataset_id, benchmark_dataset_id, config_mode, created_at, archive_path, commands_json, bundle_dir, storage_provider, storage_bucket
                 FROM daltp_bundles
                 WHERE id = %s AND owner_id = %s
                 LIMIT 1;
@@ -575,6 +616,8 @@ def get_bundle(bundle_id: str, owner_id: str) -> dict[str, Any] | None:
         "archivePath": row[11],
         "commands": _json_load(row[12], {"local": [], "colab": []}),
         "bundleDir": row[13],
+        "storageProvider": row[14],
+        "storageBucket": row[15],
     }
 
 
@@ -590,9 +633,9 @@ def upsert_job(metadata: dict[str, Any]) -> None:
             cur.execute(
                 """
                 INSERT INTO daltp_jobs
-                    (id, owner_id, type, title, status, created_at, updated_at, metadata_json, result_json, error, log_path, job_dir)
+                    (id, owner_id, type, title, status, created_at, updated_at, metadata_json, result_json, error, logs_text, log_path, job_dir)
                 VALUES
-                    (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (id) DO UPDATE SET
                     owner_id = EXCLUDED.owner_id,
                     type = EXCLUDED.type,
@@ -603,6 +646,7 @@ def upsert_job(metadata: dict[str, Any]) -> None:
                     metadata_json = EXCLUDED.metadata_json,
                     result_json = EXCLUDED.result_json,
                     error = EXCLUDED.error,
+                    logs_text = EXCLUDED.logs_text,
                     log_path = EXCLUDED.log_path,
                     job_dir = EXCLUDED.job_dir;
                 """,
@@ -617,9 +661,24 @@ def upsert_job(metadata: dict[str, Any]) -> None:
                     _json_dump(metadata.get("metadata", {})),
                     _json_dump(metadata.get("result")),
                     metadata.get("error"),
+                    metadata.get("logs", ""),
                     metadata["logPath"],
                     metadata["jobDir"],
                 ),
+            )
+
+
+def append_job_log(job_id: str, owner_id: str, text: str, updated_at: str) -> None:
+    with connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE daltp_jobs
+                SET logs_text = COALESCE(logs_text, '') || %s,
+                    updated_at = %s
+                WHERE id = %s AND owner_id = %s;
+                """,
+                (text, updated_at, job_id, owner_id),
             )
 
 
@@ -628,7 +687,7 @@ def list_jobs(owner_id: str) -> list[dict[str, Any]]:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT id, type, title, status, owner_id, created_at, updated_at, metadata_json, result_json, error, log_path, job_dir
+                SELECT id, type, title, status, owner_id, created_at, updated_at, metadata_json, result_json, error, logs_text, log_path, job_dir
                 FROM daltp_jobs
                 WHERE owner_id = %s
                 ORDER BY updated_at DESC;
@@ -648,8 +707,9 @@ def list_jobs(owner_id: str) -> list[dict[str, Any]]:
             "metadata": _json_load(row[7], {}),
             "result": _json_load(row[8], None),
             "error": row[9],
-            "logPath": row[10],
-            "jobDir": row[11],
+            "logs": row[10] or "",
+            "logPath": row[11],
+            "jobDir": row[12],
         }
         for row in rows
     ]
@@ -660,7 +720,7 @@ def get_job(job_id: str, owner_id: str) -> dict[str, Any] | None:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT id, type, title, status, owner_id, created_at, updated_at, metadata_json, result_json, error, log_path, job_dir
+                SELECT id, type, title, status, owner_id, created_at, updated_at, metadata_json, result_json, error, logs_text, log_path, job_dir
                 FROM daltp_jobs
                 WHERE id = %s AND owner_id = %s
                 LIMIT 1;
@@ -681,8 +741,9 @@ def get_job(job_id: str, owner_id: str) -> dict[str, Any] | None:
         "metadata": _json_load(row[7], {}),
         "result": _json_load(row[8], None),
         "error": row[9],
-        "logPath": row[10],
-        "jobDir": row[11],
+        "logs": row[10] or "",
+        "logPath": row[11],
+        "jobDir": row[12],
     }
 
 
@@ -692,9 +753,9 @@ def upsert_model(metadata: dict[str, Any]) -> None:
             cur.execute(
                 """
                 INSERT INTO daltp_models
-                    (id, owner_id, name, source, base_model, peft_method, lora_rank, run_name, bundle_id, created_at, files_json, model_dir, archive_path)
+                    (id, owner_id, name, source, base_model, peft_method, lora_rank, run_name, bundle_id, created_at, files_json, storage_provider, storage_bucket, model_dir, archive_path, archive_size_mb)
                 VALUES
-                    (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (id) DO UPDATE SET
                     owner_id = EXCLUDED.owner_id,
                     name = EXCLUDED.name,
@@ -706,8 +767,11 @@ def upsert_model(metadata: dict[str, Any]) -> None:
                     bundle_id = EXCLUDED.bundle_id,
                     created_at = EXCLUDED.created_at,
                     files_json = EXCLUDED.files_json,
+                    storage_provider = EXCLUDED.storage_provider,
+                    storage_bucket = EXCLUDED.storage_bucket,
                     model_dir = EXCLUDED.model_dir,
-                    archive_path = EXCLUDED.archive_path;
+                    archive_path = EXCLUDED.archive_path,
+                    archive_size_mb = EXCLUDED.archive_size_mb;
                 """,
                 (
                     metadata["id"],
@@ -721,8 +785,11 @@ def upsert_model(metadata: dict[str, Any]) -> None:
                     metadata.get("bundleId"),
                     metadata["createdAt"],
                     _json_dump(metadata.get("files", [])),
+                    metadata.get("storageProvider", "supabase"),
+                    metadata.get("storageBucket", ""),
                     metadata["modelDir"],
                     metadata["archivePath"],
+                    metadata.get("archiveSizeMb"),
                 ),
             )
 
@@ -732,7 +799,7 @@ def list_models(owner_id: str) -> list[dict[str, Any]]:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT id, name, source, base_model, peft_method, lora_rank, run_name, created_at, files_json, archive_path, model_dir
+                SELECT id, name, source, base_model, peft_method, lora_rank, run_name, created_at, files_json, storage_provider, storage_bucket, archive_path, model_dir, archive_size_mb
                 FROM daltp_models
                 WHERE owner_id = %s
                 ORDER BY created_at DESC;
@@ -751,8 +818,11 @@ def list_models(owner_id: str) -> list[dict[str, Any]]:
             "runName": row[6],
             "createdAt": row[7].isoformat() if hasattr(row[7], "isoformat") else row[7],
             "files": _json_load(row[8], []),
-            "archivePath": row[9],
-            "modelDir": row[10],
+            "storageProvider": row[9] or "azure_blob",
+            "storageBucket": row[10] or "",
+            "archivePath": row[11],
+            "modelDir": row[12],
+            "archiveSizeMb": row[13],
         }
         for row in rows
     ]
@@ -763,7 +833,7 @@ def get_model(model_id: str, owner_id: str) -> dict[str, Any] | None:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT id, name, source, base_model, peft_method, lora_rank, run_name, created_at, files_json, archive_path, model_dir
+                SELECT id, name, source, base_model, peft_method, lora_rank, run_name, created_at, files_json, storage_provider, storage_bucket, archive_path, model_dir, archive_size_mb
                 FROM daltp_models
                 WHERE id = %s AND owner_id = %s
                 LIMIT 1;
@@ -783,8 +853,11 @@ def get_model(model_id: str, owner_id: str) -> dict[str, Any] | None:
         "runName": row[6],
         "createdAt": row[7].isoformat() if hasattr(row[7], "isoformat") else row[7],
         "files": _json_load(row[8], []),
-        "archivePath": row[9],
-        "modelDir": row[10],
+        "storageProvider": row[9] or "azure_blob",
+        "storageBucket": row[10] or "",
+        "archivePath": row[11],
+        "modelDir": row[12],
+        "archiveSizeMb": row[13],
     }
 
 
@@ -794,21 +867,55 @@ def delete_model(model_id: str, owner_id: str) -> None:
             cur.execute("DELETE FROM daltp_models WHERE id = %s AND owner_id = %s;", (model_id, owner_id))
 
 
-def upsert_eval_run(run_id: str, owner_id: str, run_name: str, created_at: str, created_by: str | None, run_dir: str) -> None:
+def upsert_eval_run(
+    run_id: str,
+    owner_id: str,
+    run_name: str,
+    created_at: str,
+    created_by: str | None,
+    run_dir: str,
+    *,
+    updated_at: str | None = None,
+    storage_provider: str | None = None,
+    storage_bucket: str | None = None,
+    archive_path: str | None = None,
+    manifest: dict[str, Any] | None = None,
+    summary: dict[str, Any] | None = None,
+) -> None:
     with connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO daltp_eval_runs (id, owner_id, run_name, created_at, created_by, run_dir)
-                VALUES (%s, %s, %s, %s, %s, %s)
+                INSERT INTO daltp_eval_runs
+                    (id, owner_id, run_name, created_at, updated_at, created_by, run_dir, storage_provider, storage_bucket, archive_path, manifest_json, summary_json)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (id) DO UPDATE SET
                     owner_id = EXCLUDED.owner_id,
                     run_name = EXCLUDED.run_name,
                     created_at = EXCLUDED.created_at,
+                    updated_at = EXCLUDED.updated_at,
                     created_by = EXCLUDED.created_by,
-                    run_dir = EXCLUDED.run_dir;
+                    run_dir = EXCLUDED.run_dir,
+                    storage_provider = EXCLUDED.storage_provider,
+                    storage_bucket = EXCLUDED.storage_bucket,
+                    archive_path = EXCLUDED.archive_path,
+                    manifest_json = EXCLUDED.manifest_json,
+                    summary_json = EXCLUDED.summary_json;
                 """,
-                (run_id, owner_id, run_name, created_at, created_by, run_dir),
+                (
+                    run_id,
+                    owner_id,
+                    run_name,
+                    created_at,
+                    updated_at or created_at,
+                    created_by,
+                    run_dir,
+                    storage_provider,
+                    storage_bucket,
+                    archive_path,
+                    _json_dump(manifest),
+                    _json_dump(summary),
+                ),
             )
 
 
@@ -816,7 +923,12 @@ def list_eval_runs(owner_id: str) -> list[dict[str, Any]]:
     with connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT id, run_name, created_at, created_by, run_dir FROM daltp_eval_runs WHERE owner_id = %s ORDER BY created_at DESC;",
+                """
+                SELECT id, run_name, created_at, updated_at, created_by, run_dir, storage_provider, storage_bucket, archive_path, manifest_json, summary_json
+                FROM daltp_eval_runs
+                WHERE owner_id = %s
+                ORDER BY created_at DESC;
+                """,
                 (owner_id,),
             )
             rows = cur.fetchall()
@@ -825,8 +937,14 @@ def list_eval_runs(owner_id: str) -> list[dict[str, Any]]:
             "id": row[0],
             "runName": row[1],
             "createdAt": row[2].isoformat() if hasattr(row[2], "isoformat") else row[2],
-            "createdBy": row[3],
-            "runDir": row[4],
+            "updatedAt": row[3].isoformat() if hasattr(row[3], "isoformat") else row[3],
+            "createdBy": row[4],
+            "runDir": row[5],
+            "storageProvider": row[6],
+            "storageBucket": row[7],
+            "archivePath": row[8],
+            "manifest": _json_load(row[9], {}),
+            "summary": _json_load(row[10], None),
         }
         for row in rows
     ]
@@ -836,7 +954,12 @@ def get_eval_run(run_id: str, owner_id: str) -> dict[str, Any] | None:
     with connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT id, run_name, created_at, created_by, run_dir FROM daltp_eval_runs WHERE id = %s AND owner_id = %s LIMIT 1;",
+                """
+                SELECT id, run_name, created_at, updated_at, created_by, run_dir, storage_provider, storage_bucket, archive_path, manifest_json, summary_json
+                FROM daltp_eval_runs
+                WHERE id = %s AND owner_id = %s
+                LIMIT 1;
+                """,
                 (run_id, owner_id),
             )
             row = cur.fetchone()
@@ -846,9 +969,21 @@ def get_eval_run(run_id: str, owner_id: str) -> dict[str, Any] | None:
         "id": row[0],
         "runName": row[1],
         "createdAt": row[2].isoformat() if hasattr(row[2], "isoformat") else row[2],
-        "createdBy": row[3],
-        "runDir": row[4],
+        "updatedAt": row[3].isoformat() if hasattr(row[3], "isoformat") else row[3],
+        "createdBy": row[4],
+        "runDir": row[5],
+        "storageProvider": row[6],
+        "storageBucket": row[7],
+        "archivePath": row[8],
+        "manifest": _json_load(row[9], {}),
+        "summary": _json_load(row[10], None),
     }
+
+
+def delete_eval_run(run_id: str, owner_id: str) -> None:
+    with connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM daltp_eval_runs WHERE id = %s AND owner_id = %s;", (run_id, owner_id))
 
 
 def migrate_legacy_runtime() -> None:
@@ -909,6 +1044,8 @@ def migrate_legacy_runtime() -> None:
                 continue
             manifest["ownerId"] = manifest.get("ownerId", owner_id)
             manifest["jobDir"] = str(job_dir)
+            manifest["logPath"] = manifest.get("logPath", str(job_dir / "job.log"))
+            manifest["logs"] = _read_text(job_dir / "job.log")
             upsert_job(manifest)
 
     for owner_dir in MODELS_DIR.iterdir() if MODELS_DIR.exists() else []:
@@ -936,8 +1073,13 @@ def migrate_legacy_runtime() -> None:
                     "bundleId": manifest.get("bundleId"),
                     "createdAt": manifest.get("createdAt", ""),
                     "files": manifest.get("files", []),
+                    "storageProvider": manifest.get("storageProvider", "local"),
+                    "storageBucket": manifest.get("storageBucket", ""),
                     "modelDir": str(model_dir),
-                    "archivePath": str(model_dir.with_suffix(".zip")),
+                    "archivePath": manifest.get("archivePath", str(model_dir.with_suffix(".zip"))),
+                    "archiveSizeMb": round(model_dir.with_suffix(".zip").stat().st_size / (1024 * 1024), 2)
+                    if model_dir.with_suffix(".zip").exists()
+                    else None,
                 }
             )
 
@@ -947,6 +1089,7 @@ def migrate_legacy_runtime() -> None:
         if not run_dir.is_dir():
             continue
         manifest = _read_json(run_dir / run_manifest_name, {})
+        summary = _read_json(run_dir / "scored" / "comparison_summary.json", None)
         if not manifest or not manifest.get("ownerId") or not user_exists(manifest["ownerId"]):
             continue
         upsert_eval_run(
@@ -954,11 +1097,18 @@ def migrate_legacy_runtime() -> None:
             owner_id=manifest["ownerId"],
             run_name=manifest.get("runName", run_dir.name),
             created_at=manifest.get("createdAt", ""),
+            updated_at=manifest.get("createdAt", ""),
             created_by=manifest.get("createdBy"),
             run_dir=str(run_dir),
+            storage_provider="local",
+            storage_bucket="",
+            archive_path="",
+            manifest=manifest,
+            summary=summary if isinstance(summary, dict) else None,
         )
 
 
 def initialize_metadata_store() -> None:
     ensure_tables()
-    migrate_legacy_runtime()
+    if os.getenv("DALTP_MIGRATE_LEGACY_RUNTIME", "").strip().lower() in {"1", "true", "yes"}:
+        migrate_legacy_runtime()

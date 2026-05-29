@@ -139,6 +139,9 @@ function App() {
     name: "",
     kind: "qa",
     files: [],
+    corpusDatasetId: "",
+    modelName: "openrouter/auto",
+    apiBase: "https://openrouter.ai/api/v1",
     qaNumPairs: 4,
     qaChunkSize: 2500,
     qaChunkOverlap: 150,
@@ -168,7 +171,8 @@ function App() {
   const [evaluationError, setEvaluationError] = useState("");
   const [evaluationNotice, setEvaluationNotice] = useState("");
   const [creatingEvaluationJob, setCreatingEvaluationJob] = useState(false);
-  const [uploadingEvaluationBenchmark, setUploadingEvaluationBenchmark] = useState(false);
+  const [downloadingRunId, setDownloadingRunId] = useState("");
+  const [deletingRunId, setDeletingRunId] = useState("");
   const [trainingForm, setTrainingForm] = useState({
     runName: "",
     executionMode: "colab",
@@ -187,14 +191,11 @@ function App() {
     benchmarkMode: "existing",
     benchmarkDatasetId: "",
     corpusDatasetId: "",
+    modelId: "",
     runBase: true,
     runRag: true,
     runFineTuned: true,
     runFineTunedRag: true,
-  });
-  const [evaluationBenchmarkUpload, setEvaluationBenchmarkUpload] = useState({
-    name: "",
-    files: [],
   });
   const [modelImportForm, setModelImportForm] = useState({
     name: "",
@@ -260,9 +261,23 @@ function App() {
   }, [datasetsResponse]);
 
   useEffect(() => {
+    const availableModels = (modelsResponse.models ?? []).filter(
+      (model) => (model.storageProvider ?? "azure_blob") === "azure_blob" && model.archivePath
+    );
+    setEvaluationForm((current) => ({
+      ...current,
+      modelId:
+        current.modelId && availableModels.some((model) => model.id === current.modelId)
+          ? current.modelId
+          : availableModels[0]?.id ?? "",
+    }));
+  }, [modelsResponse]);
+
+  useEffect(() => {
     const previousJobs = previousJobsRef.current;
     for (const job of jobsResponse.jobs ?? []) {
-      const previousStatus = previousJobs.get(job.id);
+      const previousSnapshot = previousJobs.get(job.id);
+      const previousStatus = previousSnapshot?.status;
       if (previousStatus && previousStatus !== job.status) {
         if (job.status === "completed") {
           pushToast("success", `${job.title} completed successfully.`);
@@ -270,7 +285,18 @@ function App() {
           pushToast("error", job.error ? `${job.title} failed: ${job.error}` : `${job.title} failed.`);
         }
       }
-      previousJobs.set(job.id, job.status);
+      if (job.type === "evaluation") {
+        const previousCompletedModes = previousSnapshot?.completedModes ?? [];
+        const currentCompletedModes = job.metadata?.completedModes ?? [];
+        const newlyCompletedModes = currentCompletedModes.filter((mode) => !previousCompletedModes.includes(mode));
+        for (const mode of newlyCompletedModes) {
+          pushToast("success", `${job.title}: ${prettifyLabel(mode.replaceAll("_", " "))} finished.`);
+        }
+      }
+      previousJobs.set(job.id, {
+        status: job.status,
+        completedModes: job.metadata?.completedModes ?? [],
+      });
     }
 
     for (const existingId of Array.from(previousJobs.keys())) {
@@ -283,6 +309,9 @@ function App() {
   const datasets = datasetsResponse.datasets ?? [];
   const jobs = jobsResponse.jobs ?? [];
   const models = modelsResponse.models ?? [];
+  const deployableEvaluationModels = models.filter(
+    (model) => (model.storageProvider ?? "azure_blob") === "azure_blob" && model.archivePath
+  );
   const selectedBundle = useMemo(
     () => bundles.find((bundle) => bundle.id === selectedBundleId) ?? bundles[0] ?? null,
     [bundles, selectedBundleId]
@@ -356,7 +385,7 @@ function App() {
     if (activeToken) {
       headers.set("Authorization", `Bearer ${activeToken}`);
     }
-    if (options.body && !headers.has("Content-Type")) {
+    if (options.body && !(options.body instanceof FormData) && !headers.has("Content-Type")) {
       headers.set("Content-Type", "application/json");
     }
 
@@ -596,6 +625,11 @@ function App() {
       if (runsResponse.ok) {
         const runsJson = await runsResponse.json();
         setRuns(runsJson.runs ?? []);
+        setSelectedRunId((current) =>
+          current && (runsJson.runs ?? []).some((run) => run.id === current)
+            ? current
+            : runsJson.runs?.[0]?.id ?? null
+        );
       }
       if (jobsApiResponse.ok) {
         const jobsJson = await jobsApiResponse.json();
@@ -830,14 +864,21 @@ function App() {
       setGenerationError(`A dataset named "${datasetGeneration.name.trim()}" already exists in this account.`);
       return;
     }
-    if (!datasetGeneration.files.length) {
+    if (datasetGeneration.kind === "benchmark" && !datasetGeneration.corpusDatasetId) {
+      setGenerationError("Choose a corpus dataset before generating a benchmark dataset.");
+      return;
+    }
+    if (datasetGeneration.kind !== "benchmark" && !datasetGeneration.files.length) {
       setGenerationError("Choose source documents before generating a dataset.");
       return;
     }
 
     setGeneratingDataset(true);
     try {
-      const filePayloads = await Promise.all(datasetGeneration.files.map((entry) => buildUploadFilePayload(entry)));
+      const filePayloads =
+        datasetGeneration.kind === "benchmark"
+          ? []
+          : await Promise.all(datasetGeneration.files.map((entry) => buildUploadFilePayload(entry)));
 
       const response = await authFetch("/api/datasets/generate", {
         method: "POST",
@@ -845,6 +886,9 @@ function App() {
           name: datasetGeneration.name,
           kind: datasetGeneration.kind,
           files: filePayloads,
+          corpusDatasetId: datasetGeneration.kind === "benchmark" ? datasetGeneration.corpusDatasetId : null,
+          modelName: datasetGeneration.modelName,
+          apiBase: datasetGeneration.apiBase,
           chunkSize: Number(datasetGeneration.corpusChunkSize),
           chunkOverlap: Number(datasetGeneration.corpusChunkOverlap),
           qaNumPairs: Number(datasetGeneration.qaNumPairs),
@@ -869,6 +913,9 @@ function App() {
         name: "",
         kind: "qa",
         files: [],
+        corpusDatasetId: "",
+        modelName: "openrouter/auto",
+        apiBase: "https://openrouter.ai/api/v1",
         qaNumPairs: 4,
         qaChunkSize: 2500,
         qaChunkOverlap: 150,
@@ -896,6 +943,31 @@ function App() {
         relativePath: file.webkitRelativePath || file.name,
       })),
     };
+  }
+
+  function normalizeModelImportFiles(fileList) {
+    const selected = Array.from(fileList ?? []).map((file) => ({
+      file,
+      displayName: file.webkitRelativePath || file.name,
+      relativePath: file.webkitRelativePath || file.name,
+    }));
+
+    let skippedCheckpoints = 0;
+    const files = selected.filter((entry) => {
+      const relativePath = String(entry.relativePath || "").replace(/\\/g, "/");
+      if (!relativePath.includes("/")) {
+        return true;
+      }
+      const pathParts = relativePath.split("/").filter(Boolean);
+      const hasCheckpointDir = pathParts.some((part) => /^checkpoint-\d+$/i.test(part));
+      if (hasCheckpointDir) {
+        skippedCheckpoints += 1;
+        return false;
+      }
+      return true;
+    });
+
+    return { files, skippedCheckpoints };
   }
 
   function handleDatasetFileSelection(fileList) {
@@ -929,11 +1001,17 @@ function App() {
   }
 
   function handleModelImportFileSelection(fileList) {
-    const normalized = normalizeSelectedFiles(fileList);
+    const normalized = normalizeModelImportFiles(fileList);
     setModelImportForm((current) => ({
       ...current,
-      ...normalized,
+      files: normalized.files,
     }));
+    if (normalized.skippedCheckpoints) {
+      pushToast(
+        "info",
+        `Skipped ${normalized.skippedCheckpoints} checkpoint file${normalized.skippedCheckpoints > 1 ? "s" : ""} during model import. DALTP only needs the final exported artifact files.`
+      );
+    }
   }
 
   async function handleIngestCorpusDataset(dataset) {
@@ -994,18 +1072,36 @@ function App() {
 
     setImportingModel(true);
     try {
-      const filePayloads = await Promise.all(modelImportForm.files.map((entry) => buildUploadFilePayload(entry)));
-      const response = await authFetch("/api/models/import", {
-        method: "POST",
-        body: JSON.stringify({
-          name: modelImportForm.name,
-          source: modelImportForm.source,
-          baseModel: modelImportForm.baseModel,
-          peftMethod: modelImportForm.peftMethod,
-          loraRank: Number(modelImportForm.loraRank),
-          files: filePayloads,
-        }),
-      });
+      const singleZipEntry =
+        modelImportForm.files.length === 1 && /\.zip$/i.test(modelImportForm.files[0]?.file?.name || "");
+
+      let response;
+      if (singleZipEntry) {
+        const formData = new FormData();
+        formData.append("name", modelImportForm.name);
+        formData.append("source", modelImportForm.source);
+        formData.append("baseModel", modelImportForm.baseModel);
+        formData.append("peftMethod", modelImportForm.peftMethod);
+        formData.append("loraRank", String(Number(modelImportForm.loraRank)));
+        formData.append("archive", modelImportForm.files[0].file);
+        response = await authFetch("/api/models/import-archive", {
+          method: "POST",
+          body: formData,
+        });
+      } else {
+        const filePayloads = await Promise.all(modelImportForm.files.map((entry) => buildUploadFilePayload(entry)));
+        response = await authFetch("/api/models/import", {
+          method: "POST",
+          body: JSON.stringify({
+            name: modelImportForm.name,
+            source: modelImportForm.source,
+            baseModel: modelImportForm.baseModel,
+            peftMethod: modelImportForm.peftMethod,
+            loraRank: Number(modelImportForm.loraRank),
+            files: filePayloads,
+          }),
+        });
+      }
       if (!response.ok) {
         const detail = await safeErrorMessage(response);
         throw new Error(detail);
@@ -1091,14 +1187,15 @@ function App() {
       return;
     }
     if (evaluationForm.benchmarkMode === "existing" && !evaluationForm.benchmarkDatasetId) {
-      setEvaluationError("Choose a benchmark dataset or switch to generated benchmark mode.");
+      setEvaluationError("Choose a benchmark dataset before running evaluation.");
       return;
     }
-    if (
-      (evaluationForm.runRag || evaluationForm.runFineTunedRag || evaluationForm.benchmarkMode === "generate") &&
-      !evaluationForm.corpusDatasetId
-    ) {
-      setEvaluationError("Choose a corpus dataset for RAG evaluation or benchmark generation.");
+    if ((evaluationForm.runRag || evaluationForm.runFineTunedRag) && !evaluationForm.corpusDatasetId) {
+      setEvaluationError("Choose a corpus dataset for RAG evaluation.");
+      return;
+    }
+    if ((evaluationForm.runFineTuned || evaluationForm.runFineTunedRag) && !evaluationForm.modelId) {
+      setEvaluationError("Choose a model artifact for fine-tuned evaluation.");
       return;
     }
 
@@ -1121,6 +1218,59 @@ function App() {
       setEvaluationError(error.message || "Evaluation launch failed.");
     } finally {
       setCreatingEvaluationJob(false);
+    }
+  }
+
+  async function handleDownloadEvaluationRun(runId, runName) {
+    setEvaluationError("");
+    setDownloadingRunId(runId);
+    try {
+      const response = await authFetch(`/api/runs/${runId}/download`);
+      if (!response.ok) {
+        const detail = await safeErrorMessage(response);
+        throw new Error(detail);
+      }
+      const blob = await response.blob();
+      const objectUrl = window.URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = objectUrl;
+      anchor.download = `${slugifyValue(runName || "evaluation-run")}.zip`;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      window.URL.revokeObjectURL(objectUrl);
+    } catch (error) {
+      setEvaluationError(error.message || "Evaluation download failed.");
+    } finally {
+      setDownloadingRunId("");
+    }
+  }
+
+  async function handleDeleteEvaluationRun(runId, runName) {
+    const confirmed = window.confirm(`Remove the evaluation run "${runName}"?`);
+    if (!confirmed) {
+      return;
+    }
+
+    setEvaluationError("");
+    setEvaluationNotice("");
+    setDeletingRunId(runId);
+    try {
+      const response = await authFetch(`/api/runs/${runId}`, { method: "DELETE" });
+      if (!response.ok) {
+        const detail = await safeErrorMessage(response);
+        throw new Error(detail);
+      }
+      if (selectedRunId === runId) {
+        setSelectedRunId(null);
+        setSummary(initialSummary);
+      }
+      setEvaluationNotice(`Removed evaluation run ${runName}.`);
+      await refreshDatasetsAndBundles();
+    } catch (error) {
+      setEvaluationError(error.message || "Evaluation removal failed.");
+    } finally {
+      setDeletingRunId("");
     }
   }
 
@@ -1196,56 +1346,6 @@ function App() {
       setBundleError(error.message || "Run bundle removal failed.");
     } finally {
       setDeletingBundleId("");
-    }
-  }
-
-  async function handleEvaluationBenchmarkUpload() {
-    setEvaluationError("");
-    setEvaluationNotice("");
-
-    if (!evaluationBenchmarkUpload.name.trim()) {
-      setEvaluationError("Give the benchmark dataset a clear name first.");
-      return;
-    }
-    if (datasets.some((dataset) => normalizedClientName(dataset.name) === normalizedClientName(evaluationBenchmarkUpload.name))) {
-      setEvaluationError(`A dataset named "${evaluationBenchmarkUpload.name.trim()}" already exists in this account.`);
-      return;
-    }
-    if (!evaluationBenchmarkUpload.files.length) {
-      setEvaluationError("Choose at least one benchmark dataset file to upload.");
-      return;
-    }
-
-    setUploadingEvaluationBenchmark(true);
-    try {
-      const filePayloads = await Promise.all(evaluationBenchmarkUpload.files.map((entry) => buildUploadFilePayload(entry)));
-      const response = await authFetch("/api/datasets/upload", {
-        method: "POST",
-        body: JSON.stringify({
-          name: evaluationBenchmarkUpload.name,
-          kind: "benchmark",
-          files: filePayloads,
-        }),
-      });
-
-      if (!response.ok) {
-        const detail = await safeErrorMessage(response);
-        throw new Error(detail);
-      }
-
-      const payload = await response.json();
-      setEvaluationBenchmarkUpload({ name: "", files: [] });
-      setEvaluationForm((current) => ({
-        ...current,
-        benchmarkMode: "existing",
-        benchmarkDatasetId: payload.dataset.id,
-      }));
-      setEvaluationNotice(`Uploaded benchmark dataset ${payload.dataset.name}. It is now selected for this evaluation.`);
-      await refreshDatasetsAndBundles();
-    } catch (error) {
-      setEvaluationError(error.message || "Benchmark upload failed.");
-    } finally {
-      setUploadingEvaluationBenchmark(false);
     }
   }
 
@@ -1332,7 +1432,7 @@ function App() {
             </div>
 
             <div className="two-col">
-              <Card title="Recent scored runs" subtitle="Only evaluation runs created in this account are shown here.">
+              <Card title="Recent scored runs" subtitle="Only completed evaluation reports from this account are shown here.">
                 {dashboard.recentRuns.length ? (
                   <div className="run-list">
                     {dashboard.recentRuns.map((run) => (
@@ -1822,12 +1922,12 @@ function App() {
                       <div className="upload-dropzone">
                         <strong>Choose trained model files</strong>
                         <span>
-                          Upload the adapter files produced by training. For Colab-assisted runs, export the finished artifact files and import them here.
+                          Upload the adapter files produced by training, or a single exported zip from Colab. DALTP can unpack a model zip during import.
                         </span>
                         <em>{modelImportSummaryText}</em>
                         <div className="upload-actions-inline">
                           <button type="button" className="btn btn-outline btn-tight" onClick={() => document.getElementById("model-files")?.click()}>
-                            Choose model files
+                            Choose model zip or files
                           </button>
                           <button type="button" className="upload-link-btn" onClick={() => document.getElementById("model-folder")?.click()}>
                             Choose a folder instead
@@ -1859,7 +1959,7 @@ function App() {
                             </div>
                           ))
                         ) : (
-                          <span className="file-empty">Choose the adapter files or a folder exported from Colab/local training.</span>
+                          <span className="file-empty">Choose a model zip, the adapter files, or a folder exported from Colab/local training.</span>
                         )}
                       </div>
                     </FormField>
@@ -1940,6 +2040,10 @@ function App() {
                           <dd>{selectedModel.loraRank ?? "--"}</dd>
                         </div>
                         <div>
+                          <dt>Storage</dt>
+                          <dd>{selectedModel.storageBucket ?? "--"}</dd>
+                        </div>
+                        <div>
                           <dt>Files</dt>
                           <dd>{selectedModel.fileCount ?? 0}</dd>
                         </div>
@@ -1989,7 +2093,7 @@ function App() {
             />
 
             <div className="two-col">
-              <Card title="Launch evaluation" subtitle="Run benchmark generation, predictions, and scoring locally from DALTP.">
+              <Card title="Launch evaluation" subtitle="Run predictions and scoring against a benchmark dataset already stored in DALTP.">
                 <form className="form-grid" onSubmit={handleCreateEvaluationJob}>
                   <FormField label="Evaluation trial name">
                     <input
@@ -2000,100 +2104,20 @@ function App() {
                     />
                   </FormField>
 
-                  <FormField label="Benchmark source">
-                    <div className="pill-row">
-                      <button
-                        type="button"
-                        className={`pill-button ${evaluationForm.benchmarkMode === "existing" ? "selected" : ""}`}
-                        onClick={() => setEvaluationForm((current) => ({ ...current, benchmarkMode: "existing" }))}
-                      >
-                        Existing benchmark
-                      </button>
-                      <button
-                        type="button"
-                        className={`pill-button ${evaluationForm.benchmarkMode === "generate" ? "selected" : ""}`}
-                        onClick={() => setEvaluationForm((current) => ({ ...current, benchmarkMode: "generate" }))}
-                      >
-                        Create from corpus dataset
-                      </button>
-                    </div>
+                  <FormField label="Benchmark dataset">
+                    {benchmarkDatasets.length ? (
+                      <CustomSelect
+                        value={evaluationForm.benchmarkDatasetId}
+                        options={benchmarkDatasets.map((dataset) => ({ value: dataset.id, label: dataset.name }))}
+                        onChange={(value) => setEvaluationForm((current) => ({ ...current, benchmarkMode: "existing", benchmarkDatasetId: value }))}
+                        placeholder="Choose a benchmark dataset"
+                      />
+                    ) : (
+                      <div className="field-empty-note">No benchmark dataset is in this account yet. Generate or upload one from Dataset Registry first.</div>
+                    )}
                   </FormField>
 
-                  {evaluationForm.benchmarkMode === "existing" ? (
-                    <>
-                      <FormField label="Benchmark dataset">
-                        {benchmarkDatasets.length ? (
-                          <CustomSelect
-                            value={evaluationForm.benchmarkDatasetId}
-                            options={benchmarkDatasets.map((dataset) => ({ value: dataset.id, label: dataset.name }))}
-                            onChange={(value) => setEvaluationForm((current) => ({ ...current, benchmarkDatasetId: value }))}
-                            placeholder="Choose a benchmark dataset"
-                          />
-                        ) : (
-                          <div className="field-empty-note">No benchmark dataset is in this account yet. Upload one below or switch to benchmark creation from a corpus dataset.</div>
-                        )}
-                      </FormField>
-
-                      <FormField label="Upload benchmark dataset">
-                        <div className="inline-upload-card">
-                          <input
-                            className="text-input"
-                            value={evaluationBenchmarkUpload.name}
-                            onChange={(event) => setEvaluationBenchmarkUpload((current) => ({ ...current, name: event.target.value }))}
-                            placeholder="consult-benchmark"
-                          />
-                          <div className="upload-actions-inline">
-                            <button
-                              type="button"
-                              className="btn btn-outline btn-tight"
-                              onClick={() => document.getElementById("evaluation-benchmark-files")?.click()}
-                            >
-                              Choose benchmark files
-                            </button>
-                            <button
-                              type="button"
-                              className="btn btn-primary btn-tight"
-                              onClick={handleEvaluationBenchmarkUpload}
-                              disabled={uploadingEvaluationBenchmark}
-                            >
-                              {uploadingEvaluationBenchmark ? "Uploading..." : "Upload benchmark"}
-                            </button>
-                          </div>
-                          <input
-                            id="evaluation-benchmark-files"
-                            className="file-input hidden-input"
-                            type="file"
-                            multiple
-                            accept=".json,.jsonl,.csv,.txt"
-                            onChange={(event) =>
-                              setEvaluationBenchmarkUpload((current) => ({
-                                ...current,
-                                files: Array.from(event.target.files ?? []).map((file) => ({
-                                  file,
-                                  displayName: file.name,
-                                  relativePath: file.name,
-                                })),
-                              }))
-                            }
-                          />
-                          <div className="file-list">
-                            {evaluationBenchmarkUpload.files.length ? (
-                              evaluationBenchmarkUpload.files.map((entry) => (
-                                <div key={entry.relativePath} className="file-item">
-                                  <span className="file-name">{entry.displayName}</span>
-                                  <strong>{formatBytes(entry.file.size)}</strong>
-                                </div>
-                              ))
-                            ) : (
-                              <span className="file-empty">Upload a ready-made benchmark dataset file if you already have one.</span>
-                            )}
-                          </div>
-                        </div>
-                      </FormField>
-                    </>
-                  ) : null}
-
-                  <FormField label={evaluationForm.benchmarkMode === "generate" ? "Corpus dataset for benchmark creation" : "Corpus / RAG dataset"}>
+                  <FormField label="Corpus / RAG dataset">
                     {corpusDatasets.length ? (
                       <CustomSelect
                         value={evaluationForm.corpusDatasetId}
@@ -2105,6 +2129,24 @@ function App() {
                       <div className="field-empty-note">Generate or upload a corpus dataset first.</div>
                     )}
                   </FormField>
+
+                  {evaluationForm.runFineTuned || evaluationForm.runFineTunedRag ? (
+                    <FormField label="Model artifact for fine-tuned modes">
+                      {deployableEvaluationModels.length ? (
+                        <CustomSelect
+                          value={evaluationForm.modelId}
+                          options={deployableEvaluationModels.map((model) => ({
+                            value: model.id,
+                            label: `${model.name} (${prettifyLabel(model.peftMethod)} - rank ${model.loraRank ?? "--"})`,
+                          }))}
+                          onChange={(value) => setEvaluationForm((current) => ({ ...current, modelId: value }))}
+                          placeholder="Choose a model artifact"
+                        />
+                      ) : (
+                        <div className="field-empty-note">Import a trained model into Model Registry before running fine-tuned evaluation.</div>
+                      )}
+                    </FormField>
+                  ) : null}
 
                   <FormField label="Systems to score">
                     <div className="choice-grid two">
@@ -2128,6 +2170,9 @@ function App() {
                         </button>
                       ))}
                     </div>
+                    <div className="field-empty-note">
+                      Base and RAG predictions run through OpenRouter. Fine-tuned modes use your configured Modal evaluation endpoint.
+                    </div>
                   </FormField>
 
                   {evaluationNotice ? <div className="form-message success">{evaluationNotice}</div> : null}
@@ -2135,7 +2180,7 @@ function App() {
 
                   <div className="form-actions">
                     <button type="submit" className="btn btn-primary" disabled={creatingEvaluationJob}>
-                      {creatingEvaluationJob ? "Starting evaluation..." : "Run evaluation locally"}
+                      {creatingEvaluationJob ? "Starting evaluation..." : "Run evaluation"}
                     </button>
                   </div>
                 </form>
@@ -2151,7 +2196,32 @@ function App() {
               </Card>
             </div>
 
-            <Card title="System comparison" subtitle={summary.runName ? `${summary.runName} - ${summary.benchmarkSize} benchmark samples` : "No evaluation results available yet"}>
+            <Card
+              title="System comparison"
+              subtitle={summary.runName ? `${summary.runName} - ${summary.benchmarkSize} benchmark samples` : "No evaluation results available yet"}
+              action={
+                summary.runId ? (
+                  <div className="bundle-actions">
+                    <button
+                      type="button"
+                      className="btn btn-outline"
+                      onClick={() => handleDownloadEvaluationRun(summary.runId, summary.runName)}
+                      disabled={downloadingRunId === summary.runId}
+                    >
+                      {downloadingRunId === summary.runId ? "Downloading..." : "Download report"}
+                    </button>
+                    <button
+                      type="button"
+                      className="btn btn-danger"
+                      onClick={() => handleDeleteEvaluationRun(summary.runId, summary.runName)}
+                      disabled={deletingRunId === summary.runId}
+                    >
+                      {deletingRunId === summary.runId ? "Removing..." : "Remove run"}
+                    </button>
+                  </div>
+                ) : null
+              }
+            >
                 {(summary.systems ?? []).length ? (
                   <div className="compare-table-wrap">
                     <table className="compare-table">
@@ -2204,7 +2274,7 @@ function App() {
                 subtitle={
                   datasetFormMode === "upload"
                     ? "Add a ready-made QA, instruction, or benchmark dataset to the registry."
-                    : "Create corpus, QA, or instruction datasets from raw source files inside DALTP."
+                    : "Create corpus, QA, instruction, or benchmark datasets from raw source files inside DALTP."
                 }
               >
                 <div className="dataset-form-switch">
@@ -2338,12 +2408,29 @@ function App() {
                         options={[
                           { value: "qa", label: "QA dataset" },
                           { value: "instruction", label: "Instruction dataset" },
+                          { value: "benchmark", label: "Benchmark dataset" },
                           { value: "corpus", label: "Corpus dataset" },
                         ]}
                         onChange={(value) => setDatasetGeneration((current) => ({ ...current, kind: value }))}
                       />
                     </FormField>
 
+                    {datasetGeneration.kind === "benchmark" ? (
+                      <FormField label="Corpus dataset for benchmark generation">
+                        {corpusDatasets.length ? (
+                          <CustomSelect
+                            value={datasetGeneration.corpusDatasetId}
+                            options={corpusDatasets.map((dataset) => ({ value: dataset.id, label: dataset.name }))}
+                            onChange={(value) => setDatasetGeneration((current) => ({ ...current, corpusDatasetId: value }))}
+                            placeholder="Choose a corpus dataset"
+                          />
+                        ) : (
+                          <div className="field-empty-note">Create or upload a corpus dataset first, then choose it here for benchmark generation.</div>
+                        )}
+                      </FormField>
+                    ) : null}
+
+                    {datasetGeneration.kind !== "benchmark" ? (
                     <FormField label="Source documents">
                       <div className="upload-dropzone">
                         <strong>Choose source documents</strong>
@@ -2398,11 +2485,12 @@ function App() {
                         )}
                       </div>
                     </FormField>
+                    ) : null}
 
-                    {datasetGeneration.kind === "qa" ? (
+                    {datasetGeneration.kind === "qa" || datasetGeneration.kind === "benchmark" ? (
                       <>
                         <div className="inline-form-row">
-                          <FormField label="QA pairs per context">
+                          <FormField label={datasetGeneration.kind === "benchmark" ? "Benchmark pairs per context" : "QA pairs per context"}>
                             <input
                               className="text-input"
                               type="number"
@@ -2420,6 +2508,11 @@ function App() {
                               onChange={(event) => setDatasetGeneration((current) => ({ ...current, qaChunkSize: Number(event.target.value) }))}
                             />
                           </FormField>
+                        </div>
+                        <div className="field-empty-note">
+                          {datasetGeneration.kind === "benchmark"
+                            ? "Use held-out documents here so the benchmark stays separate from your QA and instruction training datasets."
+                            : "Use training documents here to generate QA data for fine-tuning."}
                         </div>
                       </>
                     ) : null}
@@ -2500,6 +2593,9 @@ function App() {
                             name: "",
                             kind: "qa",
                             files: [],
+                            corpusDatasetId: "",
+                            modelName: "openrouter/auto",
+                            apiBase: "https://openrouter.ai/api/v1",
                             qaNumPairs: 4,
                             qaChunkSize: 2500,
                             qaChunkOverlap: 150,
