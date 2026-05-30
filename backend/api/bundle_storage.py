@@ -29,10 +29,7 @@ def require_supabase_bundle_storage() -> None:
         return
     raise HTTPException(
         status_code=500,
-        detail=(
-            "Supabase run bundle storage is not configured. Set SUPABASE_URL, "
-            "SUPABASE_SERVICE_ROLE_KEY, and SUPABASE_RUN_BUNDLES_BUCKET before creating run bundles."
-        ),
+        detail="Run bundle storage is not available yet. Please ask the workspace owner to finish storage setup before creating run bundles.",
     )
 
 
@@ -65,10 +62,10 @@ def _raise_storage_error(exc: Exception, action: str) -> None:
             detail = exc.read().decode("utf-8", errors="ignore")
         except Exception:
             detail = str(exc)
-        raise HTTPException(status_code=500, detail=f"Supabase run bundle storage {action} failed: {detail or exc.reason}") from exc
+        raise HTTPException(status_code=500, detail=f"DALTP could not {action} the run bundle. Please try again later.") from exc
     if isinstance(exc, URLError):
-        raise HTTPException(status_code=500, detail=f"Supabase run bundle storage {action} failed: {exc.reason}") from exc
-    raise HTTPException(status_code=500, detail=f"Supabase run bundle storage {action} failed: {exc}") from exc
+        raise HTTPException(status_code=500, detail="DALTP could not reach run bundle storage. Please try again later.") from exc
+    raise HTTPException(status_code=500, detail=f"DALTP could not {action} the run bundle. Please try again later.") from exc
 
 
 def upload_bundle_archive(local_path: Path, *, user_id: str, bundle_id: str) -> dict[str, str]:

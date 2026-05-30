@@ -29,10 +29,7 @@ def require_supabase_evaluation_storage() -> None:
         return
     raise HTTPException(
         status_code=500,
-        detail=(
-            "Supabase evaluation storage is not configured. Set SUPABASE_URL, "
-            "SUPABASE_SERVICE_ROLE_KEY, and SUPABASE_EVALUATIONS_BUCKET before running evaluation."
-        ),
+        detail="Evaluation report storage is not available yet. Please ask the workspace owner to finish storage setup before running evaluation.",
     )
 
 
@@ -65,10 +62,10 @@ def _raise_storage_error(exc: Exception, action: str) -> None:
             detail = exc.read().decode("utf-8", errors="ignore")
         except Exception:
             detail = str(exc)
-        raise HTTPException(status_code=500, detail=f"Supabase evaluation storage {action} failed: {detail or exc.reason}") from exc
+        raise HTTPException(status_code=500, detail=f"DALTP could not {action} the evaluation report. Please try again later.") from exc
     if isinstance(exc, URLError):
-        raise HTTPException(status_code=500, detail=f"Supabase evaluation storage {action} failed: {exc.reason}") from exc
-    raise HTTPException(status_code=500, detail=f"Supabase evaluation storage {action} failed: {exc}") from exc
+        raise HTTPException(status_code=500, detail=f"DALTP could not reach evaluation report storage. Please try again later.") from exc
+    raise HTTPException(status_code=500, detail=f"DALTP could not {action} the evaluation report. Please try again later.") from exc
 
 
 def upload_evaluation_archive(local_path: Path, *, user_id: str, run_id: str) -> dict[str, str]:
@@ -93,7 +90,7 @@ def upload_evaluation_archive(local_path: Path, *, user_id: str, run_id: str) ->
 def download_evaluation_archive_bytes(run: dict[str, Any]) -> bytes:
     require_supabase_evaluation_storage()
     if (run.get("storageProvider") or "supabase") != "supabase":
-        raise HTTPException(status_code=500, detail=f"Evaluation run '{run['runName']}' is not configured for Supabase-backed storage.")
+        raise HTTPException(status_code=500, detail=f"The evaluation report for '{run['runName']}' is not available for download.")
 
     bucket = run.get("storageBucket") or SUPABASE_EVALUATIONS_BUCKET
     object_key = run.get("archivePath") or ""

@@ -117,6 +117,10 @@ def evaluate_system(system_name, prediction_map, benchmark_map, bertscore_model,
     references = [benchmark_map[sample_id]["reference"] for sample_id in ordered_ids]
     predictions = [prediction_map[sample_id] for sample_id in ordered_ids]
 
+    print(
+        f"Running BERTScore for {system_name} on {len(ordered_ids)} samples using {bertscore_model}.",
+        flush=True,
+    )
     _, _, bert_f1 = bertscore_score(
         predictions,
         references,
@@ -124,6 +128,7 @@ def evaluate_system(system_name, prediction_map, benchmark_map, bertscore_model,
         model_type=bertscore_model,
         verbose=False,
     )
+    print(f"Finished BERTScore for {system_name}.", flush=True)
 
     examples = []
     metric_totals = {
@@ -180,13 +185,19 @@ def score_prediction_files(
     fact_threshold,
 ):
     benchmark_map = build_benchmark_map(load_jsonl(benchmark_path))
+    print(
+        f"Scoring {len(prediction_files)} system(s) against {len(benchmark_map)} benchmark samples.",
+        flush=True,
+    )
 
     output_directory = Path(output_dir)
     output_directory.mkdir(parents=True, exist_ok=True)
 
     summary = {}
     per_system_results = {}
-    for system_name, prediction_path in prediction_files.items():
+    total_systems = len(prediction_files)
+    for index, (system_name, prediction_path) in enumerate(prediction_files.items(), start=1):
+        print(f"Scoring system {index}/{total_systems}: {system_name}.", flush=True)
         prediction_map = build_prediction_map(load_jsonl(prediction_path))
         result = evaluate_system(
             system_name=system_name,

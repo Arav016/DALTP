@@ -36,10 +36,7 @@ def require_supabase_dataset_storage() -> None:
         return
     raise HTTPException(
         status_code=500,
-        detail=(
-            "Supabase dataset storage is not configured. Set SUPABASE_URL, "
-            "SUPABASE_SERVICE_ROLE_KEY, and SUPABASE_DATASETS_BUCKET before creating datasets."
-        ),
+        detail="Dataset storage is not available yet. Please ask the workspace owner to finish storage setup before creating datasets.",
     )
 
 
@@ -72,10 +69,10 @@ def _raise_storage_error(exc: Exception, action: str) -> None:
             detail = exc.read().decode("utf-8", errors="ignore")
         except Exception:
             detail = str(exc)
-        raise HTTPException(status_code=500, detail=f"Supabase dataset storage {action} failed: {detail or exc.reason}") from exc
+        raise HTTPException(status_code=500, detail=f"DALTP could not {action} the dataset file. Please try again later.") from exc
     if isinstance(exc, URLError):
-        raise HTTPException(status_code=500, detail=f"Supabase dataset storage {action} failed: {exc.reason}") from exc
-    raise HTTPException(status_code=500, detail=f"Supabase dataset storage {action} failed: {exc}") from exc
+        raise HTTPException(status_code=500, detail="DALTP could not reach dataset storage. Please try again later.") from exc
+    raise HTTPException(status_code=500, detail=f"DALTP could not {action} the dataset file. Please try again later.") from exc
 
 
 def upload_dataset_artifact(local_path: Path, *, user_id: str, dataset_id: str, stored_file_name: str, mime_type: str | None = None) -> dict[str, str]:
@@ -105,7 +102,7 @@ def download_dataset_artifact_bytes(dataset: dict[str, Any]) -> bytes:
     if storage_provider != "supabase":
         raise HTTPException(
             status_code=500,
-            detail=f"Dataset '{dataset['name']}' is not configured for Supabase-backed artifact storage.",
+            detail=f"The file for dataset '{dataset['name']}' is not available. Please re-upload or regenerate the dataset.",
         )
 
     bucket = dataset.get("storageBucket") or SUPABASE_DATASETS_BUCKET

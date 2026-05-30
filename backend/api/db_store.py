@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
@@ -15,16 +14,6 @@ except ImportError:  # pragma: no cover
 load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL")
-API_DIR = Path(__file__).resolve().parent
-RUNTIME_DIR = API_DIR / "runtime"
-AUTH_DIR = RUNTIME_DIR / "auth"
-DATASETS_DIR = RUNTIME_DIR / "datasets"
-BUNDLES_DIR = RUNTIME_DIR / "run_bundles"
-JOBS_DIR = RUNTIME_DIR / "jobs"
-MODELS_DIR = RUNTIME_DIR / "models"
-USERS_FILE = AUTH_DIR / "users.json"
-SESSIONS_FILE = AUTH_DIR / "sessions.json"
-
 
 def _require_psycopg():
     if psycopg is None:
@@ -53,24 +42,6 @@ def _json_load(value: Any, default: Any):
         return json.loads(value)
     except (TypeError, json.JSONDecodeError):
         return default
-
-
-def _read_json(path: Path, default: Any) -> Any:
-    if not path.exists():
-        return default
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return default
-
-
-def _read_text(path: Path) -> str:
-    if not path.exists():
-        return ""
-    try:
-        return path.read_text(encoding="utf-8", errors="ignore")
-    except OSError:
-        return ""
 
 
 def ensure_tables() -> None:
@@ -547,7 +518,7 @@ def upsert_bundle(metadata: dict[str, Any]) -> None:
                     metadata["archivePath"],
                     metadata.get("storageProvider"),
                     metadata.get("storageBucket"),
-                    _json_dump(metadata.get("commands", {"local": [], "colab": []})),
+                    _json_dump(metadata.get("commands", {"colab": []})),
                     _json_dump(metadata.get("instructions", {})),
                 ),
             )
@@ -579,7 +550,7 @@ def list_bundles(owner_id: str) -> list[dict[str, Any]]:
             "configMode": row[9],
             "createdAt": row[10].isoformat() if hasattr(row[10], "isoformat") else row[10],
             "archivePath": row[11],
-            "commands": _json_load(row[12], {"local": [], "colab": []}),
+            "commands": _json_load(row[12], {"colab": []}),
             "storageProvider": row[13],
             "storageBucket": row[14],
         }
@@ -614,7 +585,7 @@ def get_bundle(bundle_id: str, owner_id: str) -> dict[str, Any] | None:
         "configMode": row[9],
         "createdAt": row[10].isoformat() if hasattr(row[10], "isoformat") else row[10],
         "archivePath": row[11],
-        "commands": _json_load(row[12], {"local": [], "colab": []}),
+        "commands": _json_load(row[12], {"colab": []}),
         "bundleDir": row[13],
         "storageProvider": row[14],
         "storageBucket": row[15],
@@ -745,6 +716,12 @@ def get_job(job_id: str, owner_id: str) -> dict[str, Any] | None:
         "logPath": row[11],
         "jobDir": row[12],
     }
+
+
+def delete_job(job_id: str, owner_id: str) -> None:
+    with connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM daltp_jobs WHERE id = %s AND owner_id = %s;", (job_id, owner_id))
 
 
 def upsert_model(metadata: dict[str, Any]) -> None:
@@ -986,129 +963,5 @@ def delete_eval_run(run_id: str, owner_id: str) -> None:
             cur.execute("DELETE FROM daltp_eval_runs WHERE id = %s AND owner_id = %s;", (run_id, owner_id))
 
 
-def migrate_legacy_runtime() -> None:
-    users = _read_json(USERS_FILE, [])
-    for user in users if isinstance(users, list) else []:
-        if all(key in user for key in ("id", "name", "email", "passwordHash", "passwordSalt", "createdAt")):
-            upsert_user(user)
-
-    sessions = _read_json(SESSIONS_FILE, {})
-    for token, session in (sessions.items() if isinstance(sessions, dict) else []):
-        if isinstance(session, dict) and session.get("userId") and user_exists(session["userId"]):
-            create_session(token, session["userId"], session.get("createdAt", ""), session.get("lastSeenAt", session.get("createdAt", "")))
-
-    for owner_dir in BUNDLES_DIR.iterdir() if BUNDLES_DIR.exists() else []:
-        if not owner_dir.is_dir():
-            continue
-        owner_id = owner_dir.name
-        if not user_exists(owner_id):
-            continue
-        for bundle_dir in owner_dir.iterdir():
-            if not bundle_dir.is_dir():
-                continue
-            manifest = _read_json(bundle_dir / "manifest.json", {})
-            if not manifest:
-                continue
-            upsert_bundle(
-                {
-                    "id": manifest.get("id", bundle_dir.name),
-                    "ownerId": manifest.get("ownerId", owner_id),
-                    "runName": manifest.get("runName", bundle_dir.name),
-                    "executionMode": manifest.get("executionMode", "colab"),
-                    "baseModel": manifest.get("baseModel"),
-                    "peftMethod": manifest.get("peftMethod"),
-                    "loraRank": manifest.get("loraRank"),
-                    "qaDatasetId": manifest.get("qaDatasetId"),
-                    "instructionDatasetId": manifest.get("instructionDatasetId"),
-                    "configMode": manifest.get("configMode"),
-                    "presetId": manifest.get("presetId"),
-                    "createdAt": manifest.get("createdAt", ""),
-                    "bundleDir": str(bundle_dir),
-                    "archivePath": str(bundle_dir.with_suffix(".zip")),
-                    "commands": manifest.get("commands", {"local": [], "colab": []}),
-                    "instructions": manifest.get("instructions", {}),
-                }
-            )
-
-    for owner_dir in JOBS_DIR.iterdir() if JOBS_DIR.exists() else []:
-        if not owner_dir.is_dir():
-            continue
-        owner_id = owner_dir.name
-        if not user_exists(owner_id):
-            continue
-        for job_dir in owner_dir.iterdir():
-            if not job_dir.is_dir():
-                continue
-            manifest = _read_json(job_dir / "manifest.json", {})
-            if not manifest:
-                continue
-            manifest["ownerId"] = manifest.get("ownerId", owner_id)
-            manifest["jobDir"] = str(job_dir)
-            manifest["logPath"] = manifest.get("logPath", str(job_dir / "job.log"))
-            manifest["logs"] = _read_text(job_dir / "job.log")
-            upsert_job(manifest)
-
-    for owner_dir in MODELS_DIR.iterdir() if MODELS_DIR.exists() else []:
-        if not owner_dir.is_dir():
-            continue
-        owner_id = owner_dir.name
-        if not user_exists(owner_id):
-            continue
-        for model_dir in owner_dir.iterdir():
-            if not model_dir.is_dir():
-                continue
-            manifest = _read_json(model_dir / "manifest.json", {})
-            if not manifest:
-                continue
-            upsert_model(
-                {
-                    "id": manifest.get("id", model_dir.name),
-                    "ownerId": manifest.get("ownerId", owner_id),
-                    "name": manifest.get("name", model_dir.name),
-                    "source": manifest.get("source", "local"),
-                    "baseModel": manifest.get("baseModel"),
-                    "peftMethod": manifest.get("peftMethod"),
-                    "loraRank": manifest.get("loraRank"),
-                    "runName": manifest.get("runName"),
-                    "bundleId": manifest.get("bundleId"),
-                    "createdAt": manifest.get("createdAt", ""),
-                    "files": manifest.get("files", []),
-                    "storageProvider": manifest.get("storageProvider", "local"),
-                    "storageBucket": manifest.get("storageBucket", ""),
-                    "modelDir": str(model_dir),
-                    "archivePath": manifest.get("archivePath", str(model_dir.with_suffix(".zip"))),
-                    "archiveSizeMb": round(model_dir.with_suffix(".zip").stat().st_size / (1024 * 1024), 2)
-                    if model_dir.with_suffix(".zip").exists()
-                    else None,
-                }
-            )
-
-    eval_outputs_dir = API_DIR.parent / "evaluation" / "outputs"
-    run_manifest_name = "daltp_run.json"
-    for run_dir in eval_outputs_dir.iterdir() if eval_outputs_dir.exists() else []:
-        if not run_dir.is_dir():
-            continue
-        manifest = _read_json(run_dir / run_manifest_name, {})
-        summary = _read_json(run_dir / "scored" / "comparison_summary.json", None)
-        if not manifest or not manifest.get("ownerId") or not user_exists(manifest["ownerId"]):
-            continue
-        upsert_eval_run(
-            run_id=manifest.get("id", run_dir.name),
-            owner_id=manifest["ownerId"],
-            run_name=manifest.get("runName", run_dir.name),
-            created_at=manifest.get("createdAt", ""),
-            updated_at=manifest.get("createdAt", ""),
-            created_by=manifest.get("createdBy"),
-            run_dir=str(run_dir),
-            storage_provider="local",
-            storage_bucket="",
-            archive_path="",
-            manifest=manifest,
-            summary=summary if isinstance(summary, dict) else None,
-        )
-
-
 def initialize_metadata_store() -> None:
     ensure_tables()
-    if os.getenv("DALTP_MIGRATE_LEGACY_RUNTIME", "").strip().lower() in {"1", "true", "yes"}:
-        migrate_legacy_runtime()

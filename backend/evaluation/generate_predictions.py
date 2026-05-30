@@ -4,10 +4,7 @@ import os
 from pathlib import Path
 from urllib import error, request
 
-import torch
 from openai import OpenAI
-from peft import PeftModel
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 from backend.dataset.ingestion import embed_db, embeddings
 
@@ -46,62 +43,9 @@ def default_modal_eval_endpoint():
     return os.getenv("MODAL_EVAL_ENDPOINT") or ""
 
 
-def build_model_kwargs(args):
-    model_kwargs = {
-        "trust_remote_code": args.trust_remote_code,
-        "device_map": "auto",
-    }
-
-    if args.dtype == "bfloat16":
-        model_kwargs["dtype"] = torch.bfloat16
-    elif args.dtype == "float16":
-        model_kwargs["dtype"] = torch.float16
-    else:
-        raise ValueError(f"Unsupported dtype: {args.dtype}")
-
-    if args.load_in_4bit:
-        if args.quantization_compute_dtype == "bfloat16":
-            quant_dtype = torch.bfloat16
-        elif args.quantization_compute_dtype == "float16":
-            quant_dtype = torch.float16
-        else:
-            raise ValueError(f"Unsupported quantization compute dtype: {args.quantization_compute_dtype}")
-
-        model_kwargs["quantization_config"] = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type=args.bnb_4bit_quant_type,
-            bnb_4bit_compute_dtype=quant_dtype,
-            bnb_4bit_use_double_quant=args.bnb_4bit_use_double_quant,
-        )
-
-    return model_kwargs
-
-
-def load_generation_model(args):
-    tokenizer = AutoTokenizer.from_pretrained(args.base_model, use_fast=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "left"
-
-    model = AutoModelForCausalLM.from_pretrained(
-        args.base_model,
-        **build_model_kwargs(args),
-    )
-
-    if args.mode in {"fine_tuned", "fine_tuned_rag"}:
-        if not args.adapter_path:
-            raise ValueError(f"--adapter-path is required for mode '{args.mode}'.")
-        model = PeftModel.from_pretrained(model, args.adapter_path)
-
-    model.eval()
-    return model, tokenizer
-
-
 def validate_mode_args(args):
     if args.mode in {"rag", "fine_tuned_rag"} and not args.collection:
         raise ValueError(f"--collection is required for mode '{args.mode}'.")
-    if args.provider == "local_hf" and args.mode in {"fine_tuned", "fine_tuned_rag"} and not args.adapter_path:
-        raise ValueError(f"--adapter-path is required for mode '{args.mode}' when using local_hf.")
     if args.provider == "modal" and args.mode not in {"fine_tuned", "fine_tuned_rag"}:
         raise ValueError("Modal evaluation is only supported for fine-tuned evaluation modes.")
     if args.provider == "modal" and args.mode in {"fine_tuned", "fine_tuned_rag"}:
@@ -162,33 +106,6 @@ def build_messages(question, retrieved_chunks):
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
-
-
-def generate_answer_local(model, tokenizer, messages, max_new_tokens, temperature):
-    prompt = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
-    )
-    inputs = tokenizer(prompt, return_tensors="pt")
-    inputs = {key: value.to(model.device) for key, value in inputs.items()}
-
-    generation_kwargs = {
-        "max_new_tokens": max_new_tokens,
-        "pad_token_id": tokenizer.pad_token_id,
-        "eos_token_id": tokenizer.eos_token_id,
-    }
-    if temperature > 0:
-        generation_kwargs["do_sample"] = True
-        generation_kwargs["temperature"] = temperature
-    else:
-        generation_kwargs["do_sample"] = False
-
-    with torch.inference_mode():
-        output_ids = model.generate(**inputs, **generation_kwargs)
-
-    generated_ids = output_ids[:, inputs["input_ids"].shape[1]:]
-    return tokenizer.decode(generated_ids[0], skip_special_tokens=True).strip()
 
 
 def build_prediction_record(sample, prediction, system_name, mode, retrieved_chunks):
@@ -260,14 +177,16 @@ def build_openrouter_client(args):
     return OpenAI(
         base_url=args.api_base,
         api_key=args.api_key,
+        timeout=120.0,
     )
 
 
 def generate_predictions_openrouter(args, prepared_samples, output_path):
     client = build_openrouter_client(args)
+    total = len(prepared_samples)
 
     with output_path.open("w", encoding="utf-8") as file_handle:
-        for prepared in prepared_samples:
+        for index, prepared in enumerate(prepared_samples, start=1):
             response = client.chat.completions.create(
                 model=args.remote_model,
                 temperature=args.temperature,
@@ -283,6 +202,8 @@ def generate_predictions_openrouter(args, prepared_samples, output_path):
                 retrieved_chunks=prepared["retrieved_chunks"],
             )
             file_handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            if index == total or index % 10 == 0:
+                print(f"Generated {index}/{total} predictions for {args.mode}.", flush=True)
 
 
 def build_modal_payload(args, prepared_samples):
@@ -367,28 +288,6 @@ def generate_predictions_modal(args, prepared_samples, output_path):
             file_handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
-def generate_predictions_local_hf(args, prepared_samples, output_path):
-    model, tokenizer = load_generation_model(args)
-
-    with output_path.open("w", encoding="utf-8") as file_handle:
-        for prepared in prepared_samples:
-            prediction = generate_answer_local(
-                model=model,
-                tokenizer=tokenizer,
-                messages=prepared["messages"],
-                max_new_tokens=args.max_new_tokens,
-                temperature=args.temperature,
-            )
-            record = build_prediction_record(
-                sample=prepared["sample"],
-                prediction=prediction,
-                system_name=args.system_name,
-                mode=args.mode,
-                retrieved_chunks=prepared["retrieved_chunks"],
-            )
-            file_handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-
-
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Generate prediction JSONL files for base, RAG, fine-tuned, or fine-tuned+RAG systems."
@@ -404,37 +303,20 @@ def parse_args():
     )
     parser.add_argument(
         "--provider",
-        choices=["local_hf", "openrouter", "modal"],
-        default="local_hf",
+        choices=["openrouter", "modal"],
+        default="openrouter",
         help="Inference provider used to produce predictions.",
     )
     parser.add_argument("--base-model", required=True, help="Base Hugging Face model name or path.")
     parser.add_argument("--remote-model", default=default_openrouter_eval_model(), help="Remote model id used for OpenRouter evaluation.")
     parser.add_argument("--api-base", default=default_openrouter_api_base(), help="OpenAI-compatible API base used for OpenRouter evaluation.")
     parser.add_argument("--api-key", default=os.getenv("OPENROUTER_API_KEY") or "EMPTY", help="API key used for OpenRouter evaluation.")
-    parser.add_argument("--adapter-path", help="LoRA adapter path for local fine-tuned modes.")
     parser.add_argument("--adapter-url", help="Presigned URL for the fine-tuned adapter archive used by Modal.")
     parser.add_argument("--adapter-cache-key", help="Stable cache key for the fine-tuned adapter used by Modal.")
     parser.add_argument("--collection", help="pgvector namespace used for retrieval in RAG modes.")
     parser.add_argument("--top-k", type=int, default=3, help="Number of retrieved chunks to attach for RAG modes.")
     parser.add_argument("--max-new-tokens", type=int, default=256, help="Maximum generated tokens per answer.")
     parser.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature. Use 0 for greedy decoding.")
-    parser.add_argument(
-        "--dtype",
-        choices=["bfloat16", "float16"],
-        default="bfloat16",
-        help="Model loading dtype.",
-    )
-    parser.add_argument("--load-in-4bit", action="store_true", help="Load the model in 4-bit mode.")
-    parser.add_argument(
-        "--quantization-compute-dtype",
-        choices=["bfloat16", "float16"],
-        default="bfloat16",
-        help="Compute dtype for 4-bit quantization.",
-    )
-    parser.add_argument("--bnb-4bit-quant-type", default="nf4", help="bitsandbytes 4-bit quantization type.")
-    parser.add_argument("--bnb-4bit-use-double-quant", action="store_true", help="Enable bitsandbytes double quantization.")
-    parser.add_argument("--trust-remote-code", action="store_true", help="Pass trust_remote_code=True when loading the model.")
     parser.add_argument("--modal-endpoint", default=default_modal_eval_endpoint(), help="Modal HTTPS endpoint used for fine-tuned evaluation.")
     parser.add_argument("--model-id", help="Selected model registry artifact id.")
     parser.add_argument("--model-artifact-name", help="Selected model registry artifact name.")
@@ -458,7 +340,7 @@ def main():
     elif args.provider == "modal":
         generate_predictions_modal(args, prepared_samples, output_path)
     else:
-        generate_predictions_local_hf(args, prepared_samples, output_path)
+        raise ValueError(f"Unsupported prediction provider: {args.provider}")
 
     print(f"Wrote {len(benchmark_samples)} predictions to {output_path}")
 

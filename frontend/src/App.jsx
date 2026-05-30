@@ -4,10 +4,10 @@ const AUTH_TOKEN_KEY = "daltp.authToken";
 
 const initialDashboard = {
   stats: [
-    { label: "Evaluation runs", value: 0, subtext: "saved DALTP output runs", tone: "green" },
+    { label: "Scored runs", value: 0, subtext: "completed evaluation reports", tone: "green" },
     { label: "Best BERTScore F1", value: "0.0000", subtext: "across scored runs", tone: "green" },
-    { label: "Benchmark size", value: 0, subtext: "held-out QA samples", tone: "green" },
-    { label: "Prepared bundles", value: 0, subtext: "local + Colab launch packages", tone: "amber" },
+    { label: "My datasets", value: 0, subtext: "available in your registry", tone: "green" },
+    { label: "Prepared bundles", value: 0, subtext: "Colab launch packages", tone: "amber" },
   ],
   recentRuns: [],
   defaultRunId: null,
@@ -37,10 +37,6 @@ const initialOptions = {
     { id: "lora", label: "LoRA" },
   ],
   loraRanks: [8, 16, 32],
-  executionModes: [
-    { id: "local", label: "Local", description: "Run directly on the user's machine." },
-    { id: "colab", label: "Colab-assisted", description: "Package artifacts for Google Colab execution." },
-  ],
   configPresets: [
     {
       id: "balanced-qlora",
@@ -165,7 +161,6 @@ function App() {
   const [creatingBundle, setCreatingBundle] = useState(false);
   const [bundleSuccess, setBundleSuccess] = useState("");
   const [toasts, setToasts] = useState([]);
-  const [launchingBundleId, setLaunchingBundleId] = useState("");
   const [downloadingBundleId, setDownloadingBundleId] = useState("");
   const [deletingBundleId, setDeletingBundleId] = useState("");
   const [evaluationError, setEvaluationError] = useState("");
@@ -199,7 +194,6 @@ function App() {
   });
   const [modelImportForm, setModelImportForm] = useState({
     name: "",
-    source: "colab",
     baseModel: initialOptions.models[0].id,
     peftMethod: "qlora",
     loraRank: 16,
@@ -358,6 +352,7 @@ function App() {
     ? `${modelImportForm.files.length} item${modelImportForm.files.length > 1 ? "s" : ""} selected`
     : "No model files selected yet";
   const canPrepareRun = Boolean(trainingForm.qaDatasetId && trainingForm.instructionDatasetId);
+  const hasScoredSummary = Boolean(summary.runId && (summary.systems ?? []).length);
 
   function pushToast(tone, text) {
     const toast = { id: `${Date.now()}-${Math.random().toString(16).slice(2)}`, tone, text };
@@ -1046,7 +1041,7 @@ function App() {
       setSelectedJobId(payload.job.id);
       await refreshJobsOnly();
     } catch (error) {
-      setGenerationError(error.message || "pgvector ingestion failed.");
+      setGenerationError(error.message || "DALTP could not prepare this corpus dataset for RAG search.");
     } finally {
       setIngestingDatasetId("");
     }
@@ -1079,7 +1074,6 @@ function App() {
       if (singleZipEntry) {
         const formData = new FormData();
         formData.append("name", modelImportForm.name);
-        formData.append("source", modelImportForm.source);
         formData.append("baseModel", modelImportForm.baseModel);
         formData.append("peftMethod", modelImportForm.peftMethod);
         formData.append("loraRank", String(Number(modelImportForm.loraRank)));
@@ -1094,7 +1088,6 @@ function App() {
           method: "POST",
           body: JSON.stringify({
             name: modelImportForm.name,
-            source: modelImportForm.source,
             baseModel: modelImportForm.baseModel,
             peftMethod: modelImportForm.peftMethod,
             loraRank: Number(modelImportForm.loraRank),
@@ -1110,7 +1103,6 @@ function App() {
       setBundleSuccess(`Imported model artifact ${payload.model.name}. It is now available in your registry.`);
       setModelImportForm({
         name: "",
-        source: "colab",
         baseModel: options.models?.[0]?.id ?? initialOptions.models[0].id,
         peftMethod: "qlora",
         loraRank: 16,
@@ -1146,30 +1138,6 @@ function App() {
       setModelError(error.message || "Model download failed.");
     } finally {
       setDownloadingModelId("");
-    }
-  }
-
-  async function handleLaunchLocalTraining(bundle) {
-    setBundleError("");
-    setBundleSuccess("");
-    setLaunchingBundleId(bundle.id);
-    try {
-      const response = await authFetch(`/api/run-bundles/${bundle.id}/launch-local`, {
-        method: "POST",
-      });
-      if (!response.ok) {
-        const detail = await safeErrorMessage(response);
-        throw new Error(detail);
-      }
-      const payload = await response.json();
-      setBundleSuccess(`Started local training for ${bundle.runName}. Progress is now tracked in Jobs.`);
-      setJobsResponse((current) => ({ jobs: [payload.job, ...(current.jobs ?? [])] }));
-      setSelectedJobId(payload.job.id);
-      await refreshJobsOnly();
-    } catch (error) {
-      setBundleError(error.message || "Local training launch failed.");
-    } finally {
-      setLaunchingBundleId("");
     }
   }
 
@@ -1271,6 +1239,27 @@ function App() {
       setEvaluationError(error.message || "Evaluation removal failed.");
     } finally {
       setDeletingRunId("");
+    }
+  }
+
+  async function handleDeleteJob(job) {
+    const confirmed = window.confirm(`Remove the job "${job.title}" from this view?`);
+    if (!confirmed) {
+      return;
+    }
+
+    setEvaluationError("");
+    try {
+      const response = await authFetch(`/api/jobs/${job.id}`, { method: "DELETE" });
+      if (!response.ok) {
+        const detail = await safeErrorMessage(response);
+        throw new Error(detail);
+      }
+      setJobsResponse((current) => ({ jobs: (current.jobs ?? []).filter((entry) => entry.id !== job.id) }));
+      setSelectedJobId((current) => (current === job.id ? null : current));
+      pushToast("success", `Removed job ${job.title}.`);
+    } catch (error) {
+      setEvaluationError(error.message || "Job removal failed.");
     }
   }
 
@@ -1392,7 +1381,7 @@ function App() {
               breadcrumb="Platform / Overview"
               title="Domain Adaptive"
               emphasized="Control Room"
-              subtitle="Use DALTP as a stable frontend shell while heavier generation and training work can stay local or move into Colab when hardware is constrained."
+              subtitle="Use DALTP as a stable frontend shell while heavier training work moves through Colab and deployment-ready storage."
             />
 
             <div className="kpi-strip">
@@ -1404,7 +1393,7 @@ function App() {
             <div className="single-col">
               <Card
                 title="Current evaluation health"
-                subtitle={selectedRun ? `${selectedRun.name} - benchmark ${summary.benchmarkSize ?? 0} samples` : "No evaluation runs in this account yet"}
+                subtitle={selectedRun ? `${selectedRun.name} - benchmark ${summary.benchmarkSize ?? 0} samples` : "No completed evaluation reports in this account yet"}
                 action={
                   selectedRun ? (
                     <button
@@ -1431,7 +1420,7 @@ function App() {
               </Card>
             </div>
 
-            <div className="two-col">
+            <div className="single-col">
               <Card title="Recent scored runs" subtitle="Only completed evaluation reports from this account are shown here.">
                 {dashboard.recentRuns.length ? (
                   <div className="run-list">
@@ -1464,18 +1453,6 @@ function App() {
                   <EmptyState text="No scored runs are attached to this account yet. Launch an evaluation job to populate this view." />
                 )}
               </Card>
-
-              <Card title="Prepared launch bundles" subtitle="Reusable local and Colab handoff packages">
-                {selectedBundle ? (
-                  <BundleSummary
-                    bundle={selectedBundle}
-                    onDownload={handleDownloadBundle}
-                    downloading={downloadingBundleId === selectedBundle.id}
-                  />
-                ) : (
-                  <EmptyState text="No bundle has been prepared yet. Use the run builder to create one." />
-                )}
-              </Card>
             </div>
           </section>
 
@@ -1484,7 +1461,7 @@ function App() {
               breadcrumb="Platform / Training"
               title="Run Builder"
               emphasized="Studio"
-              subtitle="Configure a DALTP run once, then decide whether it should execute on the user's hardware or be exported into a Colab-assisted bundle."
+              subtitle="Configure a DALTP run once, then export a Colab-ready bundle for GPU fine-tuning."
             />
 
             <div className="two-col training-layout">
@@ -1498,22 +1475,6 @@ function App() {
                         onChange={(event) => updateTrainingField("runName", event.target.value)}
                         placeholder="endorsement-risk-trial"
                       />
-                    </FormField>
-
-                    <FormField label="Execution mode">
-                      <div className="choice-grid three">
-                        {options.executionModes.map((mode) => (
-                          <button
-                            key={mode.id}
-                            type="button"
-                            className={`choice-card ${trainingForm.executionMode === mode.id ? "selected" : ""}`}
-                            onClick={() => updateTrainingField("executionMode", mode.id)}
-                          >
-                            <strong>{mode.label}</strong>
-                            <span>{mode.description}</span>
-                          </button>
-                        ))}
-                      </div>
                     </FormField>
 
                     <FormField label="Base model">
@@ -1791,22 +1752,8 @@ function App() {
                         >
                           {deletingBundleId === selectedBundle.id ? "Removing..." : "Remove bundle"}
                         </button>
-                        {selectedBundle.executionMode === "local" ? (
-                          <button
-                            type="button"
-                            className="btn btn-outline"
-                            onClick={() => handleLaunchLocalTraining(selectedBundle)}
-                            disabled={launchingBundleId === selectedBundle.id}
-                          >
-                            {launchingBundleId === selectedBundle.id ? "Launching..." : "Start local training"}
-                          </button>
-                        ) : null}
                       </div>
 
-                      <CommandPanel
-                        title="Local command set"
-                        commands={selectedBundle.commands?.local ?? []}
-                      />
                       <CommandPanel
                         title="Colab command set"
                         commands={selectedBundle.commands?.colab ?? []}
@@ -1824,14 +1771,14 @@ function App() {
               breadcrumb="Platform / Models"
               title="Model"
               emphasized="Registry"
-              subtitle="Track trained adapters, download local artifacts, and import successful Colab runs back into DALTP."
+              subtitle="Track trained adapters stored in Azure Blob and import successful Colab runs back into DALTP."
             />
 
             <div className="two-col training-layout">
               <div>
                 <Card
                   title="Import trained model"
-                  subtitle="Local training registers automatically. Use this form to bring completed Colab artifacts back into the account."
+                  subtitle="Bring completed Colab adapter artifacts back into the account and store them in Azure Blob."
                 >
                   <form className="form-grid" onSubmit={handleImportModelArtifact}>
                     <FormField label="Model artifact name">
@@ -1843,47 +1790,16 @@ function App() {
                       />
                     </FormField>
 
-                    <div className="inline-form-row">
-                      <FormField label="Source">
-                        <div className="choice-grid two">
-                          {[
-                            {
-                              id: "colab",
-                              label: "Colab-assisted",
-                              description: "Import artifact files after training finishes in Colab.",
-                            },
-                            {
-                              id: "manual",
-                              label: "Manual import",
-                              description: "Register adapter files from another local or external run.",
-                            },
-                          ].map((source) => (
-                            <button
-                              key={source.id}
-                              type="button"
-                              className={`choice-card ${modelImportForm.source === source.id ? "selected" : ""}`}
-                              onClick={() => setModelImportForm((current) => ({ ...current, source: source.id }))}
-                            >
-                              <strong>{source.label}</strong>
-                              <span>{source.description}</span>
-                            </button>
-                          ))}
-                        </div>
-                      </FormField>
-
-                      <FormField label="Base model">
-                        <div className="locked-model-card">
-                          <strong>{primaryModel.name}</strong>
-                          <span>{primaryModel.provider} - {primaryModel.params}</span>
-                          <span>{primaryModel.vramHint}</span>
-                        </div>
-                      </FormField>
-                    </div>
+                    <FormField label="Base model">
+                      <div className="locked-model-card">
+                        <strong>{primaryModel.name}</strong>
+                        <span>{primaryModel.provider} - {primaryModel.params}</span>
+                        <span>{primaryModel.vramHint}</span>
+                      </div>
+                    </FormField>
 
                     <div className="field-empty-note">
-                      {modelImportForm.source === "colab"
-                        ? "Use this when DALTP prepared the run bundle, training happened in Colab, and you now want to bring the finished adapter files back into your account."
-                        : "Use this when you already have trained adapter files outside DALTP and want to register them for download and reuse."}
+                      Upload the finished adapter artifact after training. DALTP stores the archive in Azure Blob and uses it for fine-tuned evaluation through Modal.
                     </div>
 
                     <div className="inline-form-row">
@@ -1959,7 +1875,7 @@ function App() {
                             </div>
                           ))
                         ) : (
-                          <span className="file-empty">Choose a model zip, the adapter files, or a folder exported from Colab/local training.</span>
+                          <span className="file-empty">Choose a model zip, the adapter files, or a folder exported from Colab training.</span>
                         )}
                       </div>
                     </FormField>
@@ -1977,7 +1893,6 @@ function App() {
                         onClick={() =>
                           setModelImportForm({
                             name: "",
-                            source: "colab",
                             baseModel: options.models?.[0]?.id ?? initialOptions.models[0].id,
                             peftMethod: "qlora",
                             loraRank: 16,
@@ -2005,14 +1920,14 @@ function App() {
                         >
                           <div className="bundle-item-main">
                             <strong>{model.name}</strong>
-                            <span>{prettifyLabel(model.source)} - {prettifyLabel(model.peftMethod)} - rank {model.loraRank ?? "--"}</span>
+                            <span>{prettifyLabel(model.peftMethod)} - rank {model.loraRank ?? "--"}</span>
                           </div>
                           <StatusPill status="Done" />
                         </button>
                       ))}
                     </div>
                   ) : (
-                    <EmptyState text="No trained model artifacts are attached to this account yet. Run training locally or import a completed Colab artifact." />
+                    <EmptyState text="No trained model artifacts are attached to this account yet. Import a completed Colab artifact to populate this registry." />
                   )}
 
                   {selectedModel ? (
@@ -2026,10 +1941,6 @@ function App() {
                         <div>
                           <dt>Base model</dt>
                           <dd>{selectedModel.baseModel?.split("/").pop() ?? "--"}</dd>
-                        </div>
-                        <div>
-                          <dt>Source</dt>
-                          <dd>{prettifyLabel(selectedModel.source)}</dd>
                         </div>
                         <div>
                           <dt>PEFT</dt>
@@ -2072,11 +1983,9 @@ function App() {
                         </button>
                       </div>
 
-                      {selectedModel.source === "colab" ? (
-                        <div className="field-empty-note">
-                          This artifact was imported back into DALTP after a Colab-assisted run. DALTP keeps Colab as a handoff path, then registers the finished files here for download and reuse.
-                        </div>
-                      ) : null}
+                      <div className="field-empty-note">
+                        This artifact is stored in Azure Blob-backed model storage and can be selected for fine-tuned evaluation.
+                      </div>
                     </div>
                   ) : null}
                 </Card>
@@ -2189,9 +2098,8 @@ function App() {
               <Card title="Evaluation jobs" subtitle="Only evaluation runs are shown here so scoring activity is easier to follow.">
                 <JobPanel
                   jobs={evaluationJobs}
-                  selectedJob={evaluationJobs.find((job) => job.id === selectedJob?.id) ?? evaluationJobs[0] ?? null}
-                  onSelectJob={setSelectedJobId}
-                  emptyText="No evaluation jobs yet. Launch a benchmark run from this screen to populate scoring activity."
+                  onDeleteJob={handleDeleteJob}
+                  emptyText="No evaluation jobs yet. Launch a benchmark run to populate job history."
                 />
               </Card>
             </div>
@@ -2200,7 +2108,7 @@ function App() {
               title="System comparison"
               subtitle={summary.runName ? `${summary.runName} - ${summary.benchmarkSize} benchmark samples` : "No evaluation results available yet"}
               action={
-                summary.runId ? (
+                hasScoredSummary ? (
                   <div className="bundle-actions">
                     <button
                       type="button"
@@ -2248,7 +2156,7 @@ function App() {
                     </table>
                   </div>
                 ) : (
-                  <EmptyState text="Launch an evaluation job to populate per-system scoring here." />
+                  <EmptyState text="Choose a completed scored run, or launch a new evaluation job to populate per-system metrics here." />
                 )}
             </Card>
           </section>
@@ -2966,49 +2874,32 @@ function ActivityBanner({ jobs, onOpenDatasets, onOpenEvaluation }) {
   );
 }
 
-function JobPanel({ jobs, selectedJob, onSelectJob, emptyText }) {
+function JobPanel({ jobs, onDeleteJob, emptyText }) {
   if (!jobs.length) {
-    return <EmptyState text={emptyText || "No background jobs yet. Dataset generation, local training, and evaluation runs will appear here."} />;
+    return <EmptyState text={emptyText || "No background jobs yet. Dataset generation, ingestion, and evaluation runs will appear here."} />;
   }
 
   return (
     <div className="job-panel">
       <div className="job-list">
         {jobs.map((job) => (
-          <button
+          <div
             key={job.id}
-            type="button"
-            className={`bundle-item ${selectedJob?.id === job.id ? "selected" : ""}`}
-            onClick={() => onSelectJob(job.id)}
+            className="bundle-item job-history-row"
           >
             <div className="bundle-item-main">
               <strong>{job.title}</strong>
-              <span>{prettifyLabel(job.type)}</span>
+              <span>{job.updatedAt ? `Updated ${formatDateTime(job.updatedAt)}` : prettifyLabel(job.type)}</span>
             </div>
             <StatusPill status={job.status} />
-          </button>
+            {job.status !== "queued" && job.status !== "running" && onDeleteJob ? (
+              <button type="button" className="btn btn-danger btn-tight" onClick={() => onDeleteJob(job)}>
+                Remove
+              </button>
+            ) : null}
+          </div>
         ))}
       </div>
-
-      {selectedJob ? (
-        <div className="job-detail">
-          <dl className="detail-list">
-            <div>
-              <dt>Job type</dt>
-              <dd>{prettifyLabel(selectedJob.type)}</dd>
-            </div>
-            <div>
-              <dt>Status</dt>
-              <dd><StatusPill status={selectedJob.status} /></dd>
-            </div>
-          </dl>
-          {selectedJob.error ? <div className="form-message error">{selectedJob.error}</div> : null}
-          {selectedJob.result?.runId ? (
-            <div className="field-empty-note">Evaluation run `{selectedJob.result.runId}` is now available in the reports view.</div>
-          ) : null}
-          <pre className="command-box">{selectedJob.logs || "No logs yet."}</pre>
-        </div>
-      ) : null}
     </div>
   );
 }
@@ -3030,7 +2921,7 @@ function BundleSummary({ bundle, onDownload, downloading }) {
           <button type="button" className="text-link-button" onClick={() => onDownload(bundle)} disabled={downloading}>
             {downloading ? "Downloading..." : "Fetch the zip bundle"}
           </button>{" "}
-          and move it into the user's local DALTP repo or a Colab session.
+          and move it into a Colab session.
         </p>
       </div>
     </div>
@@ -3218,6 +3109,19 @@ function formatMetric(value) {
     return "--";
   }
   return value.toFixed(4);
+}
+
+function formatDateTime(value) {
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return "--";
+  }
+  return parsed.toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
 }
 
 function formatBytes(size) {

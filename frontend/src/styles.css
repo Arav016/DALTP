@@ -1543,6 +1543,10 @@ button {
   flex-wrap: wrap;
 }
 
+.compact-actions {
+  margin-top: 12px;
+}
+
 .form-message {
   border-radius: 12px;
   padding: 12px 14px;
@@ -1574,8 +1578,12 @@ button {
   text-align: left;
 }
 
+.job-history-row {
+  cursor: default;
+}
+
 .bundle-item.selected,
-.bundle-item:hover {
+.bundle-item:not(.job-history-row):hover {
   border-color: var(--accent);
   box-shadow: 0 8px 20px rgba(29, 78, 216, 0.08);
 }
@@ -1650,6 +1658,30 @@ button {
   line-height: 1.55;
   white-space: pre-wrap;
   color: var(--ink-mid);
+}
+
+.progress-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.progress-line {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  color: var(--ink-mid);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.progress-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: var(--accent);
+  flex: 0 0 auto;
+  margin-top: 6px;
 }
 
 .callout-box {

@@ -33,11 +33,7 @@ def require_azure_model_storage() -> None:
         return
     raise HTTPException(
         status_code=500,
-        detail=(
-            "Azure model storage is not configured. Set AZURE_STORAGE_CONNECTION_STRING, "
-            "AZURE_STORAGE_CONTAINER_NAME, AZURE_STORAGE_ACCOUNT_NAME, and "
-            "AZURE_STORAGE_ACCOUNT_KEY before importing model artifacts."
-        ),
+        detail="Model storage is not available yet. Please ask the workspace owner to finish storage setup before importing model artifacts.",
     )
 
 
@@ -63,10 +59,10 @@ def _raise_storage_error(exc: Exception, action: str) -> None:
     if isinstance(exc, HTTPException):
         raise exc
     if isinstance(exc, ResourceNotFoundError):
-        raise HTTPException(status_code=404, detail=f"Azure model storage {action} failed: artifact not found.") from exc
+        raise HTTPException(status_code=404, detail="The selected model artifact files could not be found. Please re-import the model artifact.") from exc
     if isinstance(exc, AzureError):
-        raise HTTPException(status_code=500, detail=f"Azure model storage {action} failed: {exc}") from exc
-    raise HTTPException(status_code=500, detail=f"Azure model storage {action} failed: {exc}") from exc
+        raise HTTPException(status_code=500, detail=f"DALTP could not {action} the model artifact. Please try again later.") from exc
+    raise HTTPException(status_code=500, detail=f"DALTP could not {action} the model artifact. Please try again later.") from exc
 
 
 def upload_model_archive(local_path: Path, *, user_id: str, model_id: str) -> dict[str, str]:
@@ -87,12 +83,12 @@ def upload_model_archive(local_path: Path, *, user_id: str, model_id: str) -> di
 def download_model_archive_bytes(model: dict[str, Any]) -> bytes:
     require_azure_model_storage()
     if (model.get("storageProvider") or STORAGE_PROVIDER) != STORAGE_PROVIDER:
-        raise HTTPException(status_code=500, detail=f"{_archive_label(model)} is not configured for Azure-backed storage.")
+        raise HTTPException(status_code=500, detail=f"{_archive_label(model)} is not available in model storage. Please re-import the model artifact.")
 
     blob_name = model.get("archivePath") or ""
     container = model.get("storageBucket") or AZURE_STORAGE_CONTAINER_NAME
     if not blob_name:
-        raise HTTPException(status_code=500, detail=f"{_archive_label(model)} is missing its stored archive path.")
+        raise HTTPException(status_code=500, detail=f"{_archive_label(model)} is missing its files. Please re-import the model artifact.")
 
     try:
         blob_client = _blob_service_client().get_blob_client(container=container, blob=blob_name)
@@ -105,12 +101,12 @@ def download_model_archive_bytes(model: dict[str, Any]) -> bytes:
 def create_model_archive_signed_url(model: dict[str, Any], *, expires_in: int = 60 * 30) -> str:
     require_azure_model_storage()
     if (model.get("storageProvider") or STORAGE_PROVIDER) != STORAGE_PROVIDER:
-        raise HTTPException(status_code=500, detail=f"{_archive_label(model)} is not configured for Azure-backed storage.")
+        raise HTTPException(status_code=500, detail=f"{_archive_label(model)} is not available in model storage. Please re-import the model artifact.")
 
     blob_name = model.get("archivePath") or ""
     container = model.get("storageBucket") or AZURE_STORAGE_CONTAINER_NAME
     if not blob_name:
-        raise HTTPException(status_code=500, detail=f"{_archive_label(model)} is missing its stored archive path.")
+        raise HTTPException(status_code=500, detail=f"{_archive_label(model)} is missing its files. Please re-import the model artifact.")
 
     try:
         sas_token = generate_blob_sas(
